@@ -1,0 +1,195 @@
+文件特征值
+查xmon  取第一条
+
+
+https://api.ti.360.cn/v2/file
+      "risk": "high",
+
+
+http://xmon.netlab.qihoo.net/#
+Raw.ref_sample
+
+
+
+iuayeu.net，依据ioc(iuayeu.net),关联样本（9f598306ce09599f9f8adbbd905dcf43）
+
+
+http://xmon.netlab.qihoo.net/#
+Raw.report_links
+
+
+拼ioc,
+查xmon，看归属，
+atateam siyubo wd netlab unknow(Disabled)
+
+Keep No Match:
+
+
+研判逻辑，
+
+规则1：hash黑的，就可以直接输出结果
+规则2：report，要是允许的list才行，就可以直接输出结果；
+规则3：看怎么根据生产方的数据拼出来  证据一句话
+
+那就最后的execl
+
+我梳理差不多了，可以一点点对清楚了
+张楚坤
+curl -X POST 'https://api.ti.360.net/custom/intelligence/v1/tags' -H 'Content-Type: application/json' -H 'X-Api-Key: api_key' -H 'sign: sign' -H 'timestamp: timestamp' -d '{
+        "query": {
+            "keywords": [
+                {
+                    "field": "category",
+                    "value": "url"
+                },
+                {
+                    "field": "query",
+                    "value": "https://ayudascliente.com/captcha.php"
+                },
+                {
+                  "field": "flag",
+                  "value": "2"
+                }   
+            ]
+        }
+    }'
+李思逸
+wd.zip
+李思逸
+input2html_history.py
+张楚坤
+data.level	int	70	危害等级，0-100的整十数分级，30为未知，30以下为白，30以上为黑，30-50为低危，50-60为中危，60-70为高危，70以上为关键
+
+
+https://doc.sc.b.qihoo.net/api/external-output
+张楚坤：curl -X POST 'https://api.ti.360.net/custom/intelligence/v1/tags' -H 'Content-Type: application/json' -H 'X-Api-Key: api_key' -H 'sign: sign' -H 'timestamp: timestamp' -d '{ "query": { "keywords": [ { "field": "category", "value": "url" }, { "field": "query", "value": "https://ayudascliente.com/captcha.php" }, { "field": "flag", "value": "2" } ] } }'
+张楚坤
+情报导入模板_20260609.xlsx
+张楚坤
+curl -X POST 'http://api.netlab.360.com/wfy/reputation/v1' -H 'Content-Type: application/json' -H 'X-AuthToken: 6189ff22-21c8-49ab-8519-7ef85f396954' -d '["abvainvienvaiebai.net"]'
+张楚坤
+curl -X POST 'http://api.netlab.360.com/wfy/reputation/v1' -H 'Content-Type: application/json' -H 'X-AuthToken: 6189ff22-21c8-49ab-8519-7ef85f396954' -d '["96.92.242.30:80"]'
+张楚坤
+wfy接口
+张楚坤：curl -X POST 'http://api.netlab.360.com/wfy/reputation/v1' -H 'Content-Type: application/json' -H 'X-AuthToken: 6189ff22-21c8-49ab-8519-7ef85f396954' -d '["96.92.242.30:80"]'
+张楚坤
+      "judge": "black",
+张楚坤
+黑样本规则的补充信息
+
+
+buy1.mcloemb.ru，依据ioc(buy1.mcloemb.ru),关联样本（fa0018c8c9aaee50ec93e5d0bf7cac6f）
+张楚坤
+关联报告的补充信息
+
+buy1.mcloemb.ru，依据ioc(buy1.mcloemb.ru),关联报告（https://samples.vx-underground.org/APTs/2021/2021.10.20(1)/Paper/Bitdefender-DT-Whitepaper-Fivesys-creat5699-en-EN.pdf）
+取第一个
+
+[图片]
+张楚坤
+/home/xuyang-pd/qdev/maltrail/trails/static/malware/njrat.txt#2024-06-19_20:42:18 https://raw.githubusercontent.com/stamparm/aux/master/maltrail-malware-domains.txt#2023-07-12_09:01:17 https://raw.githubusercontent.com/stamparm/maltrail/master/trails/static/malware/njrat.txt @Version:2023-01-05T11:47:53Z https://twitter.com/1ZRR4H/status/1480578722465992707
+
+
+
+/home/xuyang-pd/，这种是不能直接用的
+张楚坤
+归属是wd，且恶意且有快照的
+22tu.com
+
+只要是wd的，且恶意，且有快照就暂时标记能解决
+
+
+上面除了样本，关联报告，网盾快照的，剩下就都是不能解决的
+
+
+话术模板：内容类，存在恶意快照的ioc(xx主题内容)
+张楚坤
+[图片]
+5235ffews.icu
+张楚坤
+    status_map = {
+        "ACTIVE": "存活",
+        "UNKNOWN": "失活",
+        "SINKHOLE": "被安全机构接管",
+    }
+张楚坤
+1。现有流程run起来
+关联样本的做了
+关联报告的这个没做
+快照这个没做
+src_end归属逻辑没做
+
+2.还缺的出结果分析
+因为要基于前面src_end归属的来搞
+数据分析没做
+张楚坤
+智能体，wd的要用
+张楚坤
+/home/xuyang-pd/qdev/maltrail/trails/static/malware/njrat.txt#2024-06-19_20:42:18
+
+https://raw.githubusercontent.com/stamparm/aux/master/maltrail-malware-domains.txt#2023-07-12_09:01:17
+张楚坤
+https://raw.githubusercontent.com/stamparm/aux/master/maltrail-malware-domains.txt#2023-07-12_09:01:17
+
+https://raw.githubusercontent.com/stamparm/aux/master/maltrail-malware-domains.txt
+
+
+
+
+/home/xuyang-pd/qdev/maltrail/trails/static/malware/njrat.txt#2024-06-19_20:42:18
+这种有问题的，先不采信
+张楚坤
+
+张楚坤
+顺序下来
+
+样本
+关联报告
+内容类且快照恶意（主题）
+张楚坤
+/home/xuyang-pd/qdev/maltrail/trails/static/malware/njrat.txt#2024-06-19_20:42:18
+这种有问题的，先不采信
+张楚坤
+
+张楚坤
+fidapeste2.duckdns.org
+[图片]
+张楚坤
+先格式化
+
+关联报告的
+/home/xuyang-pd/qdev/maltrail/trails/static/malware/njrat.txt#2024-06-19_20:42:18
+
+http://baidu.com/blog
+
+
+
+https://raw.githubusercontent.com/stamparm/maltrail/trails/static/malware/njrat.txt
+"/maltrail/trails/static/"
+张楚坤
+本地文件的
+张楚坤：先格式化 关联报告的 /home/xuyang-pd/qdev/maltrail/trails/static/malware/njrat.txt#2024-06-19_20:42:18 http://baidu.com/blog https://raw.githubusercontent.com/stamparm/maltrail/trails/static/malware/njrat.txt "/maltrail/trails/static/"
+张楚坤
+k01自动研判提升覆盖度_v2.xmind
+张楚坤
+@李思逸  @覃萌  
+如上，就是k01那字段怎么填
+数据分析结果要哪些
+
+目前紧急的就是数据分析结果，因为需要知道哪些预期大概能补充，哪些补不了，大概是这样 @覃萌  
+你帮忙开发实现一下，逻辑不确认的可预留着，或者直接发群里；因为有一些可能是看了最终数据才能定的，一开始想不到
+[收到]覃萌，李思逸
+张楚坤
+我跟lisiyi可能就是对接口结果稍微熟悉点，开发实现的话太拉了
+一些不确认的话直接发群里即可，三个人整快点，你发群里我跟他即时去对确认
+
+我这儿目前状态也就是根据之前写的基础版本，每天解决一点；
+后续大概你写完一版本，我就再根据新的稳定的结果去导入
+张楚坤
+[图片]
+C:\Program Files\XMind\resources
+张楚坤
+替换这个就行了
+张楚坤
+Xmind2020破解版.zip
+张楚坤06-12 17:25:47
