@@ -94,29 +94,41 @@ AI_QUICK_ANALYSIS_HEADERS = {
 
 # ===== 性能控制配置 =====
 # 这些配置直接改脚本即可，不依赖环境变量。
-REQUEST_TIMEOUT = 60
-HTTP_POOL_CONNECTIONS = 100
-HTTP_POOL_MAXSIZE = 100
-XMON_WORKERS = 24
-XMON_PROGRESS_INTERVAL = 100
-XMON_TAGMON_ENABLED = True
-XMON_TAGMON_RETRIES = 3
-XMON_TAGMON_RETRY_SLEEP = 3.0
-HASH_WORKERS = 8
-HASH_PROGRESS_INTERVAL = 200
-WFY_WORKERS = 16
-WFY_PROGRESS_INTERVAL = 100
-SC_WORKERS = 12
-SC_PROGRESS_INTERVAL = 100
-WD_WORKERS = 12
-WD_PROGRESS_INTERVAL = 100
-AI_WORKERS = 20
-AI_PROGRESS_INTERVAL = 100
-AI_RETRIES = 3
-AI_RETRY_SLEEP_SECONDS = 2.0
-SLEEP_SECONDS = 0.05
-LIMIT = 0
-XMON_MIN_SEVERITY = 30
+REQUEST_TIMEOUT = 60  # 单次 HTTP 请求超时时间，单位秒；外部接口慢时可适当调大。
+HTTP_POOL_CONNECTIONS = 100  # requests 连接池保留的连接池数量；通常无需调整。
+HTTP_POOL_MAXSIZE = 100  # 每个连接池最大连接数；应不小于主要接口的并发数。
+XMON_WORKERS = 4  # xmon 主线索和子线索批次查询并发数；过高可能压垮内网接口。
+XMON_BATCH_SIZE = 3000  # xmon 主线索每批最多 IOC 数；还会受 URL 64KB 限制。
+XMON_TAGMON_BATCH_SIZE = 500  # xmon 子线索每批最多 IOC 数；子线索返回总数受 limit=1000 影响。
+XMON_MAX_URL_BYTES = 64 * 1024  # xmon GET URL 最大字节数；超过会自动拆批。
+XMON_PROGRESS_INTERVAL = 100  # xmon 每处理多少条 IOC 打印一次进度。
+XMON_TAGMON_ENABLED = True  # 是否查询 xmon 子线索；关闭会更快，但会丢失子线索 hash/src/evidence_chain。
+XMON_TAGMON_RETRIES = 3  # xmon 子线索查询失败后的重试次数。
+XMON_TAGMON_RETRY_SLEEP = 3.0  # xmon 子线索每次重试前等待秒数。
+HASH_WORKERS = 8  # 文件情报 hash 查询批次并发数。
+HASH_BATCH_SIZE = 10  # 文件情报每批 hash 数。
+HASH_MAX_BATCH_SIZE = 10  # 文件情报接口允许的最大批量；用于防止误改超限。
+HASH_PROGRESS_INTERVAL = 200  # hash 查询每处理多少条打印一次进度。
+WFY_WORKERS = 4  # wfy 批次查询并发数；过高容易触发 429 限流。
+WFY_BATCH_SIZE = 100  # wfy 每批 IOC 数。
+WFY_MAX_BATCH_SIZE = 100  # wfy 接口允许的最大批量；用于防止误改超限。
+WFY_PROGRESS_INTERVAL = 100  # wfy 每处理多少条 IOC 打印一次进度。
+WFY_RETRIES = 4  # wfy 遇到 429 或临时异常时的最大重试次数。
+WFY_RETRY_SLEEP_SECONDS = 2.0  # wfy 重试退避基准秒数；实际等待按 2、4、8... 递增。
+SC_WORKERS = 12  # sc 批次查询并发数。
+SC_BATCH_SIZE = 80  # sc 每批 IOC 数；payload 中 query.value 用英文逗号拼接。
+SC_PROGRESS_INTERVAL = 100  # sc 每处理多少条 IOC 打印一次进度。
+WD_WORKERS = 12  # wd 查询并发数；safe 评分按批次并发，恶意 IOC 再单条查 urldb 快照。
+WD_SAFE_BATCH_SIZE = 20  # wd safe 评分接口每批 IOC 数。
+WD_SAFE_MAX_BATCH_SIZE = 20  # wd safe 评分接口允许的最大批量；第 21 条起会被接口静默截断。
+WD_PROGRESS_INTERVAL = 100  # wd 每处理多少条 IOC 打印一次进度。
+AI_WORKERS = 50  # 智能体证据链接口并发数；接口不支持批量，过高容易 500/502/超时。
+AI_PROGRESS_INTERVAL = 100  # 智能体证据链每处理多少条 IOC 打印一次进度。
+AI_RETRIES = 3  # 智能体证据链接口失败后的重试次数。
+AI_RETRY_SLEEP_SECONDS = 5.0  # 智能体证据链重试退避基准秒数；实际等待按 5、10、15... 递增。
+SLEEP_SECONDS = 0.05  # 串行分支中每次请求后的短暂停顿，降低接口压力。
+LIMIT = 0  # 调试用输入行数限制；0 表示不限制，处理全部输入。
+XMON_MIN_SEVERITY = 30  # xmon 有效线索最低 severity 阈值；当前规则为 severity > 30。
 # 调试指定 IOC 时填入集合，例如 {"5235ffews.icu"}；不需要时改成空集合 set()。
 DEBUG_IOCS = set()
 
@@ -342,7 +354,6 @@ def build_ioc(row: pd.Series) -> str:
 
 
 def result_ioc(row: pd.Series) -> str:
-    # 样例 result.xlsx 中 IOC 不带端口，保留这个口径。
     return normalize_cell(row.get("外联目标", "")) or normalize_cell(row.get("ioc", ""))
 
 
@@ -455,8 +466,43 @@ def build_xmon_batch_url(batch: list[str]) -> str:
     return f"{XMON_BASE_URL}{ioc_part}/{XMON_QUERY}"
 
 
-def build_xmon_tagmon_url(ioc: str) -> str:
-    return f"{XMON_TAGMON_BASE_URL}{quote(ioc, safe='.:_-')}{XMON_TAGMON_SUFFIX}"
+def build_xmon_tagmon_url(iocs: list[str] | str) -> str:
+    if isinstance(iocs, str):
+        ioc_part = quote(iocs, safe=".:_-")
+    else:
+        ioc_part = ",".join(quote(x, safe=".:_-") for x in iocs)
+    return f"{XMON_TAGMON_BASE_URL}{ioc_part}{XMON_TAGMON_SUFFIX}"
+
+
+def chunk_xmon_iocs_by_url(iocs: list[str], url_builder, max_count: int = XMON_BATCH_SIZE) -> list[list[str]]:
+    batches: list[list[str]] = []
+    current: list[str] = []
+    for ioc in iocs:
+        candidate = current + [ioc]
+        if current and (len(candidate) > max_count or len(url_builder(candidate).encode("utf-8")) > XMON_MAX_URL_BYTES):
+            batches.append(current)
+            current = [ioc]
+            if len(url_builder(current).encode("utf-8")) > XMON_MAX_URL_BYTES:
+                batches.append(current)
+                current = []
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+    return batches
+
+
+def group_xmon_rows_by_ioc(rows: list[dict[str, Any]], prefer_search: bool = False) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if prefer_search:
+            ioc = normalize_cell(first_not_empty(row.get("ioc_search"), row.get("ioc"), row.get("IOC"), row.get("uid")))
+        else:
+            ioc = normalize_cell(xmon_row_ioc(row))
+        if not ioc:
+            continue
+        grouped.setdefault(ioc, []).append(row)
+    return grouped
 
 
 def can_resolve_host(url: str) -> tuple[bool, str]:
@@ -502,9 +548,9 @@ def extract_child_exts_disabled(row: dict[str, Any]) -> str:
     return stringify(exts.get("disabled", "")).strip()
 
 
-def build_xmon_valid_clues(main_row: dict[str, Any], child_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_xmon_valid_clues(main_row: dict[str, Any], child_rows: list[dict[str, Any]], requested_ioc: str = "") -> list[dict[str, Any]]:
     main_disable = extract_main_ioc_disabled(main_row)
-    main_ioc = normalize_cell(main_row.get("ioc", ""))
+    main_ioc = normalize_cell(requested_ioc) or normalize_cell(main_row.get("ioc", ""))
     valid_clues: list[dict[str, Any]] = []
 
     if is_xmon_clue_enabled(main_disable) and xmon_row_severity(main_row) > XMON_MIN_SEVERITY:
@@ -551,6 +597,28 @@ def query_xmon_tagmon_children(session: Session, ioc: str) -> list[dict[str, Any
     return []
 
 
+def query_xmon_tagmon_batch(batch: list[str]) -> tuple[list[str], dict[str, list[dict[str, Any]]], str]:
+    if not XMON_TAGMON_ENABLED or not batch:
+        return batch, {ioc: [] for ioc in batch}, ""
+    session = get_thread_session()
+    url = build_xmon_tagmon_url(batch)
+    last_error = ""
+    max_attempts = XMON_TAGMON_RETRIES + 1
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            time.sleep(XMON_TAGMON_RETRY_SLEEP)
+        try:
+            resp = session.get(url, headers=XMON_HEADERS, verify=False, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            grouped = group_xmon_rows_by_ioc(extract_xmon_rows(safe_json_response(resp)))
+            for ioc in batch:
+                grouped.setdefault(ioc, [])
+            return batch, grouped, ""
+        except Exception as exc:
+            last_error = str(exc)
+    return batch, {ioc: [] for ioc in batch}, last_error
+
+
 def query_xmon_tagmon_children_worker(ioc: str) -> list[dict[str, Any]]:
     return query_xmon_tagmon_children(get_thread_session(), ioc)
 
@@ -559,25 +627,37 @@ def query_xmon_tagmon_children_many(iocs: list[str]) -> dict[str, list[dict[str,
     unique_iocs = list(dict.fromkeys(ioc for ioc in iocs if ioc))
     if not XMON_TAGMON_ENABLED or not unique_iocs:
         return {ioc: [] for ioc in unique_iocs}
-    if XMON_WORKERS <= 1 or len(unique_iocs) == 1:
-        with make_session() as session:
-            return {ioc: query_xmon_tagmon_children(session, ioc) for ioc in unique_iocs}
+    batches = chunk_xmon_iocs_by_url(unique_iocs, build_xmon_tagmon_url, XMON_TAGMON_BATCH_SIZE)
+    if XMON_WORKERS <= 1 or len(batches) == 1:
+        result_map: dict[str, list[dict[str, Any]]] = {}
+        for batch in batches:
+            _, grouped, error = query_xmon_tagmon_batch(batch)
+            if error:
+                with TAGMON_FAILED_LOCK:
+                    TAGMON_FAILED_IOCS.extend(f"{ioc} | {error}" for ioc in batch)
+            result_map.update(grouped)
+        return result_map
 
     result_map: dict[str, list[dict[str, Any]]] = {}
-    worker_count = min(XMON_WORKERS, len(unique_iocs))
+    worker_count = min(XMON_WORKERS, len(batches))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {
-            executor.submit(query_xmon_tagmon_children_worker, ioc): ioc
-            for ioc in unique_iocs
+            executor.submit(query_xmon_tagmon_batch, batch): batch
+            for batch in batches
         }
         for future in as_completed(future_map):
-            ioc = future_map[future]
+            batch = future_map[future]
             try:
-                result_map[ioc] = future.result()
+                batch, grouped, error = future.result()
+                result_map.update(grouped)
+                if error:
+                    with TAGMON_FAILED_LOCK:
+                        TAGMON_FAILED_IOCS.extend(f"{ioc} | {error}" for ioc in batch)
             except Exception as exc:
                 with TAGMON_FAILED_LOCK:
-                    TAGMON_FAILED_IOCS.append(f"{ioc} | {exc}")
-                result_map[ioc] = []
+                    TAGMON_FAILED_IOCS.extend(f"{ioc} | {exc}" for ioc in batch)
+                for ioc in batch:
+                    result_map[ioc] = []
     return result_map
 
 
@@ -596,12 +676,38 @@ def query_xmon_one(ioc: str) -> tuple[str, XmonInfo, bool, str]:
             child_rows = query_xmon_tagmon_children(session, main_ioc)
             enriched_row = dict(row)
             enriched_row["__tagmon_children"] = child_rows
-            enriched_row["__valid_clues"] = build_xmon_valid_clues(row, child_rows)
+            enriched_row["__valid_clues"] = build_xmon_valid_clues(row, child_rows, ioc)
             return ioc, normalize_xmon_row(ioc, enriched_row), True, ""
 
         return ioc, empty_xmon_info(ioc), True, ""
     except Exception as exc:
         return ioc, empty_xmon_info(ioc), False, str(exc)
+
+
+def query_xmon_main_batch(batch: list[str]) -> tuple[list[str], dict[str, list[dict[str, Any]]], str]:
+    session = get_thread_session()
+    url = build_xmon_batch_url(batch)
+    try:
+        resp = session.get(url, headers=XMON_HEADERS, verify=False, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        grouped = group_xmon_rows_by_ioc(extract_xmon_rows(safe_json_response(resp)), prefer_search=True)
+        for ioc in batch:
+            grouped.setdefault(ioc, [])
+        return batch, grouped, ""
+    except Exception as exc:
+        return batch, {ioc: [] for ioc in batch}, str(exc)
+
+
+def build_xmon_info_from_rows(requested_ioc: str, rows: list[dict[str, Any]], child_map: dict[str, list[dict[str, Any]]]) -> XmonInfo:
+    if not rows:
+        return empty_xmon_info(requested_ioc)
+    row = rows[0]
+    main_ioc = normalize_cell(row.get("ioc", "")) or requested_ioc
+    child_rows = child_map.get(requested_ioc, child_map.get(main_ioc, []))
+    enriched_row = dict(row)
+    enriched_row["__tagmon_children"] = child_rows
+    enriched_row["__valid_clues"] = build_xmon_valid_clues(row, child_rows, requested_ioc)
+    return normalize_xmon_row(requested_ioc, enriched_row)
 
 
 def query_xmon_iocs(session: Session, ioc_list: list[str]) -> dict[str, XmonInfo]:
@@ -616,23 +722,47 @@ def query_xmon_iocs(session: Session, ioc_list: list[str]) -> dict[str, XmonInfo
         print("[!] 请确认当前环境能访问内网 DNS/VPN，或在 WSL/Linux 中配置可解析 xmon.netlab.qihoo.net 的 DNS/hosts。")
         return {ioc: result_map.get(ioc, empty_xmon_info(ioc)) for ioc in ioc_list}
 
-    print(f"[+] xmon 待查询：{len(query_iocs)} 条")
-    worker_count = min(XMON_WORKERS, len(query_iocs))
+    main_batches = chunk_xmon_iocs_by_url(query_iocs, build_xmon_batch_url)
+    max_url_bytes = max((len(build_xmon_batch_url(batch).encode("utf-8")) for batch in main_batches), default=0)
+    print(
+        f"[+] xmon 主线索待查询：{len(query_iocs)} 条，批量最多 {XMON_BATCH_SIZE} 条/批，"
+        f"实际 {len(main_batches)} 批，最大 URL {max_url_bytes} bytes"
+    )
+
+    main_rows_map: dict[str, list[dict[str, Any]]] = {}
+    worker_count = min(XMON_WORKERS, len(main_batches))
     completed = 0
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {executor.submit(query_xmon_one, ioc): ioc for ioc in query_iocs}
+        future_map = {executor.submit(query_xmon_main_batch, batch): batch for batch in main_batches}
         for future in as_completed(future_map):
-            requested_ioc = future_map[future]
-            completed += 1
+            batch = future_map[future]
             try:
-                ioc, xmon_info, cacheable, error = future.result()
+                batch, grouped, error = future.result()
             except Exception as exc:
-                ioc, xmon_info, cacheable, error = requested_ioc, empty_xmon_info(requested_ioc), False, str(exc)
-            result_map[ioc] = xmon_info
-            if not cacheable and error:
-                XMON_FAILED_IOCS.append(f"{ioc} | {error}")
+                grouped = {ioc: [] for ioc in batch}
+                error = str(exc)
+            main_rows_map.update(grouped)
+            if error:
+                XMON_FAILED_IOCS.extend(f"{ioc} | {error}" for ioc in batch)
+            completed += len(batch)
             if completed % XMON_PROGRESS_INTERVAL == 0 or completed == len(query_iocs):
-                print(f"[+] xmon 查询进度：{completed}/{len(query_iocs)}")
+                print(f"[+] xmon 主线索查询进度：{completed}/{len(query_iocs)}")
+
+    main_iocs = [requested_ioc for requested_ioc, rows in main_rows_map.items() if rows]
+    child_batches = chunk_xmon_iocs_by_url(list(dict.fromkeys(main_iocs)), build_xmon_tagmon_url, XMON_TAGMON_BATCH_SIZE)
+    child_max_url_bytes = max((len(build_xmon_tagmon_url(batch).encode("utf-8")) for batch in child_batches), default=0)
+    print(
+        f"[+] xmon 子线索待查询：{len(set(main_iocs))} 条，批量最多 {XMON_TAGMON_BATCH_SIZE} 条/批，"
+        f"实际 {len(child_batches)} 批，最大 URL {child_max_url_bytes} bytes"
+    )
+    child_map = query_xmon_tagmon_children_many(main_iocs)
+
+    for requested_ioc in query_iocs:
+        result_map[requested_ioc] = build_xmon_info_from_rows(
+            requested_ioc,
+            main_rows_map.get(requested_ioc, []),
+            child_map,
+        )
     return {ioc: result_map.get(ioc, empty_xmon_info(ioc)) for ioc in ioc_list}
 
 
@@ -695,10 +825,10 @@ def query_hash_batch(session: Session, hash_list: list[str]) -> Any:
         return {"errno": -1, "msg": str(exc), "result": {}}
 
 
-def query_hash_one(hash_value: str) -> tuple[str, HashInfo]:
-    response_json = query_hash_batch(get_thread_session(), [hash_value])
-    parsed = parse_hash_result([hash_value], response_json)
-    return hash_value, parsed.get(hash_value, HashInfo(query_hash=hash_value))
+def query_hash_batch_worker(hash_batch: list[str]) -> tuple[list[str], dict[str, HashInfo]]:
+    response_json = query_hash_batch(get_thread_session(), hash_batch)
+    parsed = parse_hash_result(hash_batch, response_json)
+    return hash_batch, parsed
 
 
 def parse_hash_result(hash_list: list[str], response_json: Any) -> dict[str, HashInfo]:
@@ -753,49 +883,72 @@ def query_hashes(session: Session, hash_list: list[str]) -> dict[str, HashInfo]:
     all_hash_map: dict[str, HashInfo] = {}
     if not unique_hashes:
         return all_hash_map
-    print(f"[+] 查询 hash：{len(unique_hashes)} 条，单 hash 并发查询，并发数 {min(HASH_WORKERS, len(unique_hashes))}")
-    if HASH_WORKERS <= 1 or len(unique_hashes) == 1:
-        for hash_value in unique_hashes:
-            response_json = query_hash_batch(session, [hash_value])
-            parsed = parse_hash_result([hash_value], response_json)
+    batch_size = min(HASH_BATCH_SIZE, HASH_MAX_BATCH_SIZE)
+    batches = chunk_list(unique_hashes, batch_size)
+    print(
+        f"[+] 查询 hash：{len(unique_hashes)} 条，批量 {batch_size} 条/批，"
+        f"并发数 {min(HASH_WORKERS, len(batches))}"
+    )
+    if HASH_WORKERS <= 1 or len(batches) == 1:
+        completed = 0
+        for hash_batch in batches:
+            response_json = query_hash_batch(session, hash_batch)
+            parsed = parse_hash_result(hash_batch, response_json)
             all_hash_map.update(parsed)
+            completed += len(hash_batch)
+            if completed % HASH_PROGRESS_INTERVAL == 0 or completed == len(unique_hashes):
+                print(f"[+] hash 查询进度：{completed}/{len(unique_hashes)}")
             time.sleep(SLEEP_SECONDS)
         return all_hash_map
 
-    worker_count = min(HASH_WORKERS, len(unique_hashes))
+    worker_count = min(HASH_WORKERS, len(batches))
     completed = 0
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {executor.submit(query_hash_one, hash_value): hash_value for hash_value in unique_hashes}
+        future_map = {executor.submit(query_hash_batch_worker, hash_batch): hash_batch for hash_batch in batches}
         for future in as_completed(future_map):
-            hash_value = future_map[future]
-            completed += 1
+            hash_batch = future_map[future]
             try:
-                _, hash_info = future.result()
+                hash_batch, parsed = future.result()
+                all_hash_map.update(parsed)
             except Exception as exc:
                 with HASH_FAILED_LOCK:
-                    HASH_FAILED_QUERIES.append(f"{hash_value} | {exc}")
-                hash_info = HashInfo(query_hash=hash_value)
-            all_hash_map[hash_value] = hash_info
+                    HASH_FAILED_QUERIES.append(f"{','.join(hash_batch)} | {exc}")
+                for hash_value in hash_batch:
+                    all_hash_map[hash_value] = HashInfo(query_hash=hash_value)
+            completed += len(hash_batch)
             if completed % HASH_PROGRESS_INTERVAL == 0 or completed == len(unique_hashes):
                 print(f"[+] hash 查询进度：{completed}/{len(unique_hashes)}")
     return all_hash_map
 
 
-def query_wfy_one(ioc: str) -> tuple[str, dict[str, Any]]:
-    try:
-        session = get_thread_session()
-        resp = session.post(
-            WFY_API_URL,
-            headers=WFY_HEADERS,
-            data=json.dumps([ioc], ensure_ascii=False),
-            timeout=REQUEST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = safe_json_response(resp)
-        parsed = parse_wfy_response([ioc], data)
-        return ioc, parsed.get(ioc, {})
-    except Exception as exc:
-        return ioc, {"query_error": str(exc), "judge": ""}
+def query_wfy_batch(batch: list[str]) -> tuple[list[str], dict[str, dict[str, Any]], str]:
+    last_error = ""
+    max_attempts = WFY_RETRIES + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            session = get_thread_session()
+            resp = session.post(
+                WFY_API_URL,
+                headers=WFY_HEADERS,
+                data=json.dumps(batch, ensure_ascii=False),
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code == 429 and attempt < max_attempts:
+                retry_after = safe_int(resp.headers.get("Retry-After"), 0)
+                sleep_seconds = retry_after if retry_after > 0 else WFY_RETRY_SLEEP_SECONDS * (2 ** (attempt - 1))
+                time.sleep(sleep_seconds)
+                continue
+            resp.raise_for_status()
+            data = safe_json_response(resp)
+            return batch, parse_wfy_response(batch, data), ""
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < max_attempts:
+                time.sleep(WFY_RETRY_SLEEP_SECONDS * (2 ** (attempt - 1)))
+                continue
+            return batch, {ioc: {"query_error": last_error, "judge": ""} for ioc in batch}, last_error
+    last_error = last_error or "wfy query failed"
+    return batch, {ioc: {"query_error": last_error, "judge": ""} for ioc in batch}, last_error
 
 
 def query_wfy(session: Session, ioc_list: list[str]) -> dict[str, dict[str, Any]]:
@@ -803,34 +956,44 @@ def query_wfy(session: Session, ioc_list: list[str]) -> dict[str, dict[str, Any]
     query_iocs = list(dict.fromkeys(ioc for ioc in ioc_list if ioc))
     if not query_iocs:
         return result_map
-    print(f"[+] wfy 待查询：{len(query_iocs)} 条，单 IOC 并发查询，并发数 {min(WFY_WORKERS, len(query_iocs))}")
+    batch_size = min(WFY_BATCH_SIZE, WFY_MAX_BATCH_SIZE)
+    batches = chunk_list(query_iocs, batch_size)
+    print(
+        f"[+] wfy 待查询：{len(query_iocs)} 条，批量 {batch_size} 条/批，"
+        f"并发数 {min(WFY_WORKERS, len(batches))}，429/异常最多重试 {WFY_RETRIES} 次"
+    )
 
-    if WFY_WORKERS <= 1 or len(query_iocs) == 1:
-        for index, ioc in enumerate(query_iocs, 1):
-            ioc, info = query_wfy_one(ioc)
-            result_map[ioc] = info
-            if info.get("query_error"):
-                WFY_FAILED_QUERIES.append(f"{ioc} | {info.get('query_error')}")
-            if index % WFY_PROGRESS_INTERVAL == 0 or index == len(query_iocs):
-                print(f"[+] wfy 查询进度：{index}/{len(query_iocs)}")
+    if WFY_WORKERS <= 1 or len(batches) == 1:
+        completed = 0
+        for batch in batches:
+            _, parsed, error = query_wfy_batch(batch)
+            result_map.update(parsed)
+            if error:
+                for ioc in batch:
+                    WFY_FAILED_QUERIES.append(f"{ioc} | {error}")
+            completed += len(batch)
+            if completed % WFY_PROGRESS_INTERVAL == 0 or completed == len(query_iocs):
+                print(f"[+] wfy 查询进度：{completed}/{len(query_iocs)}")
             time.sleep(SLEEP_SECONDS)
         return result_map
 
-    worker_count = min(WFY_WORKERS, len(query_iocs))
+    worker_count = min(WFY_WORKERS, len(batches))
     completed = 0
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {executor.submit(query_wfy_one, ioc): ioc for ioc in query_iocs}
+        future_map = {executor.submit(query_wfy_batch, batch): batch for batch in batches}
         for future in as_completed(future_map):
-            fallback_ioc = future_map[future]
-            completed += 1
+            fallback_batch = future_map[future]
             try:
-                ioc, info = future.result()
+                batch, parsed, error = future.result()
             except Exception as exc:
-                ioc = fallback_ioc
-                info = {"query_error": str(exc), "judge": ""}
-            result_map[ioc] = info
-            if info.get("query_error"):
-                WFY_FAILED_QUERIES.append(f"{ioc} | {info.get('query_error')}")
+                batch = fallback_batch
+                error = str(exc)
+                parsed = {ioc: {"query_error": error, "judge": ""} for ioc in batch}
+            result_map.update(parsed)
+            if error:
+                for ioc in batch:
+                    WFY_FAILED_QUERIES.append(f"{ioc} | {error}")
+            completed += len(batch)
             if completed % WFY_PROGRESS_INTERVAL == 0 or completed == len(query_iocs):
                 print(f"[+] wfy 查询进度：{completed}/{len(query_iocs)}")
     return result_map
@@ -869,12 +1032,24 @@ def sc_category_for_ioc(ioc: str) -> str:
 
 
 def query_custom_tags(session: Session, ioc: str, category: str | None = None) -> dict[str, Any]:
-    query_category = category or sc_category_for_ioc(ioc)
+    batch, parsed, error = query_custom_tags_batch(session, [ioc], category)
+    if error:
+        return {"query_error": error}
+    return parsed.get(ioc, {})
+
+
+def query_custom_tags_batch(
+    session: Session,
+    batch: list[str],
+    category: str | None = None,
+) -> tuple[list[str], dict[str, dict[str, Any]], str]:
+    query_category = category or SC_DEFAULT_CATEGORY
+    query_value = ",".join(batch)
     payload = {
         "query": {
             "keywords": [
                 {"field": "category", "value": query_category},
-                {"field": "query", "value": ioc},
+                {"field": "query", "value": query_value},
                 {"field": "flag", "value": "2"},
             ]
         }
@@ -888,13 +1063,32 @@ def query_custom_tags(session: Session, ioc: str, category: str | None = None) -
         )
         resp.raise_for_status()
         data = safe_json_response(resp)
-        return data if isinstance(data, dict) else {}
+        return batch, parse_sc_response(batch, data), ""
     except Exception as exc:
-        return {"query_error": str(exc)}
+        return batch, {ioc: {"query_error": str(exc)} for ioc in batch}, str(exc)
 
 
-def query_custom_tags_worker(ioc: str) -> dict[str, Any]:
-    return query_custom_tags(get_thread_session(), ioc)
+def query_custom_tags_batch_worker(batch: list[str]) -> tuple[list[str], dict[str, dict[str, Any]], str]:
+    return query_custom_tags_batch(get_thread_session(), batch)
+
+
+def parse_sc_response(batch: list[str], data: Any) -> dict[str, dict[str, Any]]:
+    parsed: dict[str, dict[str, Any]] = {}
+    body = data.get("data") if isinstance(data, dict) else data
+    if isinstance(body, dict):
+        for ioc in batch:
+            value = body.get(ioc, {})
+            parsed[ioc] = value if isinstance(value, dict) else {"value": value}
+    elif isinstance(body, list):
+        for item in body:
+            if not isinstance(item, dict):
+                continue
+            ioc = first_not_empty(item.get("ioc"), item.get("query"), item.get("domain"), item.get("ip"))
+            if ioc:
+                parsed[ioc] = item
+    for ioc in batch:
+        parsed.setdefault(ioc, {})
+    return parsed
 
 
 def extract_sc_level(response_json: dict[str, Any]) -> int | None:
@@ -921,7 +1115,7 @@ def extract_sc_level(response_json: dict[str, Any]) -> int | None:
 
 def sc_is_malicious(response_json: dict[str, Any]) -> bool:
     level = extract_sc_level(response_json)
-    return level is not None and level >= 50
+    return level is not None and level > 30
 
 
 def query_sc(session: Session, ioc_list: list[str]) -> dict[str, bool]:
@@ -929,29 +1123,44 @@ def query_sc(session: Session, ioc_list: list[str]) -> dict[str, bool]:
     sc_map: dict[str, bool] = {}
     if not query_iocs:
         return sc_map
-    print(f"[+] sc 待查询：{len(query_iocs)} 条，并发数 {min(SC_WORKERS, len(query_iocs))}")
+    batches = chunk_list(query_iocs, SC_BATCH_SIZE)
+    print(
+        f"[+] sc 待查询：{len(query_iocs)} 条，批量 {SC_BATCH_SIZE} 条/批，"
+        f"并发数 {min(SC_WORKERS, len(batches))}"
+    )
 
-    if SC_WORKERS <= 1 or len(query_iocs) == 1:
-        for index, ioc in enumerate(query_iocs, 1):
-            response_json = query_custom_tags(session, ioc)
-            sc_map[ioc] = sc_is_malicious(response_json)
-            if index % SC_PROGRESS_INTERVAL == 0 or index == len(query_iocs):
-                print(f"[+] sc 查询进度：{index}/{len(query_iocs)}")
+    if SC_WORKERS <= 1 or len(batches) == 1:
+        completed = 0
+        for batch in batches:
+            _, parsed, error = query_custom_tags_batch(session, batch)
+            if error:
+                for ioc in batch:
+                    SC_FAILED_IOCS.append(f"{ioc} | {error}")
+            for ioc in batch:
+                sc_map[ioc] = sc_is_malicious(parsed.get(ioc, {}))
+            completed += len(batch)
+            if completed % SC_PROGRESS_INTERVAL == 0 or completed == len(query_iocs):
+                print(f"[+] sc 查询进度：{completed}/{len(query_iocs)}")
             time.sleep(SLEEP_SECONDS)
     else:
-        worker_count = min(SC_WORKERS, len(query_iocs))
+        worker_count = min(SC_WORKERS, len(batches))
         completed = 0
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_map = {executor.submit(query_custom_tags_worker, ioc): ioc for ioc in query_iocs}
+            future_map = {executor.submit(query_custom_tags_batch_worker, batch): batch for batch in batches}
             for future in as_completed(future_map):
-                ioc = future_map[future]
-                completed += 1
+                fallback_batch = future_map[future]
                 try:
-                    response_json = future.result()
-                    sc_map[ioc] = sc_is_malicious(response_json)
+                    batch, parsed, error = future.result()
                 except Exception as exc:
-                    SC_FAILED_IOCS.append(f"{ioc} | {exc}")
-                    sc_map[ioc] = False
+                    batch = fallback_batch
+                    parsed = {}
+                    error = str(exc)
+                if error:
+                    for ioc in batch:
+                        SC_FAILED_IOCS.append(f"{ioc} | {error}")
+                for ioc in batch:
+                    sc_map[ioc] = sc_is_malicious(parsed.get(ioc, {}))
+                completed += len(batch)
                 if completed % SC_PROGRESS_INTERVAL == 0 or completed == len(query_iocs):
                     print(f"[+] sc 查询进度：{completed}/{len(query_iocs)}")
     return sc_map
@@ -971,9 +1180,10 @@ def make_wd_safe_headers(body: str) -> dict[str, str]:
     }
 
 
-def query_wd_safe_level(session: Session, ioc: str) -> tuple[int | None, int | None, str]:
-    body = json.dumps({"data": [{"url": ioc}]}, ensure_ascii=False, separators=(",", ":"))
+def query_wd_safe_batch(batch: list[str]) -> tuple[list[str], dict[str, WdInfo], str]:
+    body = json.dumps({"data": [{"url": ioc} for ioc in batch]}, ensure_ascii=False, separators=(",", ":"))
     try:
+        session = get_thread_session()
         resp = session.post(
             WD_SAFE_API_URL,
             data=body,
@@ -983,12 +1193,29 @@ def query_wd_safe_level(session: Session, ioc: str) -> tuple[int | None, int | N
         resp.raise_for_status()
         data = safe_json_response(resp)
         results = (((data.get("data") or {}).get("results") or []) if isinstance(data, dict) else [])
-        if not results or not isinstance(results[0], dict):
-            return None, None, "wd safe empty result"
-        info = results[0].get("info") if isinstance(results[0].get("info"), dict) else {}
-        return safe_int(info.get("level"), 0), safe_int(info.get("sub_level"), 0), ""
+        result_map: dict[str, WdInfo] = {}
+        if isinstance(results, list):
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                ioc = normalize_cell(item.get("url", ""))
+                if not ioc:
+                    continue
+                info = item.get("info") if isinstance(item.get("info"), dict) else {}
+                level = safe_int(info.get("level"), 0)
+                sub_level = safe_int(info.get("sub_level"), 0)
+                result_map[ioc] = WdInfo(
+                    ioc=ioc,
+                    level=level,
+                    sub_level=sub_level,
+                    malicious=level >= 50,
+                )
+        for ioc in batch:
+            result_map.setdefault(ioc, WdInfo(ioc=ioc, query_error="wd safe empty result"))
+        return batch, result_map, ""
     except Exception as exc:
-        return None, None, str(exc)
+        error = str(exc)
+        return batch, {ioc: WdInfo(ioc=ioc, query_error=error) for ioc in batch}, error
 
 
 def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, str]:
@@ -1020,58 +1247,95 @@ def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, st
         return False, "", str(exc)
 
 
-def query_wd_one(ioc: str) -> WdInfo:
+def query_wd_history_one(ioc: str) -> tuple[str, bool, str, str]:
     session = get_thread_session()
-    level, sub_level, level_error = query_wd_safe_level(session, ioc)
-    malicious = level is not None and level >= 50
-    has_snapshot = False
-    topic = ""
-    snapshot_error = ""
-    if malicious:
-        has_snapshot, topic, snapshot_error = query_wd_history_snapshot(session, ioc)
-    query_error = "; ".join(x for x in (level_error, snapshot_error) if x)
-    return WdInfo(
-        ioc=ioc,
-        level=level,
-        sub_level=sub_level,
-        malicious=malicious,
-        has_snapshot=has_snapshot,
-        snapshot_topic=topic,
-        query_error=query_error,
-    )
+    has_snapshot, topic, error = query_wd_history_snapshot(session, ioc)
+    return ioc, has_snapshot, topic, error
 
 
 def query_wd(session: Session, ioc_list: list[str]) -> dict[str, WdInfo]:
     unique_iocs = list(dict.fromkeys(ioc for ioc in ioc_list if ioc))
     result_map: dict[str, WdInfo] = {}
-    if unique_iocs:
-        print(f"[+] wd 待查询：{len(unique_iocs)} 条，并发数 {min(WD_WORKERS, len(unique_iocs))}")
-    if WD_WORKERS <= 1 or len(unique_iocs) == 1:
-        for index, ioc in enumerate(unique_iocs, 1):
-            wd_info = query_wd_one(ioc)
-            if wd_info.query_error:
-                WD_FAILED_IOCS.append(f"{ioc} | {wd_info.query_error}")
-            result_map[ioc] = wd_info
-            if index % WD_PROGRESS_INTERVAL == 0 or index == len(unique_iocs):
-                print(f"[+] wd 查询进度：{index}/{len(unique_iocs)}")
+    if not unique_iocs:
+        return result_map
+
+    safe_batch_size = min(WD_SAFE_BATCH_SIZE, WD_SAFE_MAX_BATCH_SIZE)
+    safe_batches = chunk_list(unique_iocs, safe_batch_size)
+    print(
+        f"[+] wd safe 评分待查询：{len(unique_iocs)} 条，批量 {safe_batch_size} 条/批，"
+        f"并发数 {min(WD_WORKERS, len(safe_batches))}"
+    )
+    if WD_WORKERS <= 1 or len(safe_batches) == 1:
+        completed = 0
+        for batch in safe_batches:
+            _, parsed, error = query_wd_safe_batch(batch)
+            result_map.update(parsed)
+            if error:
+                for ioc in batch:
+                    WD_FAILED_IOCS.append(f"{ioc} | {error}")
+            completed += len(batch)
+            if completed % WD_PROGRESS_INTERVAL == 0 or completed == len(unique_iocs):
+                print(f"[+] wd safe 评分查询进度：{completed}/{len(unique_iocs)}")
             time.sleep(SLEEP_SECONDS)
     else:
-        worker_count = min(WD_WORKERS, len(unique_iocs))
+        worker_count = min(WD_WORKERS, len(safe_batches))
         completed = 0
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_map = {executor.submit(query_wd_one, ioc): ioc for ioc in unique_iocs}
+            future_map = {executor.submit(query_wd_safe_batch, batch): batch for batch in safe_batches}
             for future in as_completed(future_map):
-                ioc = future_map[future]
-                completed += 1
+                batch = future_map[future]
                 try:
-                    wd_info = future.result()
+                    batch, parsed, error = future.result()
                 except Exception as exc:
-                    wd_info = WdInfo(ioc=ioc, query_error=str(exc))
-                if wd_info.query_error:
-                    WD_FAILED_IOCS.append(f"{ioc} | {wd_info.query_error}")
-                result_map[ioc] = wd_info
+                    error = str(exc)
+                    parsed = {ioc: WdInfo(ioc=ioc, query_error=error) for ioc in batch}
+                result_map.update(parsed)
+                if error:
+                    for ioc in batch:
+                        WD_FAILED_IOCS.append(f"{ioc} | {error}")
+                completed += len(batch)
                 if completed % WD_PROGRESS_INTERVAL == 0 or completed == len(unique_iocs):
-                    print(f"[+] wd 查询进度：{completed}/{len(unique_iocs)}")
+                    print(f"[+] wd safe 评分查询进度：{completed}/{len(unique_iocs)}")
+
+    malicious_iocs = [ioc for ioc, info in result_map.items() if info.malicious]
+    if not malicious_iocs:
+        return result_map
+
+    print(f"[+] wd urldb 快照待查询：{len(malicious_iocs)} 条，并发数 {min(WD_WORKERS, len(malicious_iocs))}")
+    if WD_WORKERS <= 1 or len(malicious_iocs) == 1:
+        for index, ioc in enumerate(malicious_iocs, 1):
+            _, has_snapshot, topic, snapshot_error = query_wd_history_one(ioc)
+            info = result_map.get(ioc, WdInfo(ioc=ioc))
+            info.has_snapshot = has_snapshot
+            info.snapshot_topic = topic
+            if snapshot_error:
+                info.query_error = "; ".join(x for x in (info.query_error, snapshot_error) if x)
+                WD_FAILED_IOCS.append(f"{ioc} | {snapshot_error}")
+            result_map[ioc] = info
+            if index % WD_PROGRESS_INTERVAL == 0 or index == len(malicious_iocs):
+                print(f"[+] wd urldb 快照查询进度：{index}/{len(malicious_iocs)}")
+            time.sleep(SLEEP_SECONDS)
+        return result_map
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=min(WD_WORKERS, len(malicious_iocs))) as executor:
+        future_map = {executor.submit(query_wd_history_one, ioc): ioc for ioc in malicious_iocs}
+        for future in as_completed(future_map):
+            ioc = future_map[future]
+            completed += 1
+            try:
+                _, has_snapshot, topic, snapshot_error = future.result()
+            except Exception as exc:
+                has_snapshot, topic, snapshot_error = False, "", str(exc)
+            info = result_map.get(ioc, WdInfo(ioc=ioc))
+            info.has_snapshot = has_snapshot
+            info.snapshot_topic = topic
+            if snapshot_error:
+                info.query_error = "; ".join(x for x in (info.query_error, snapshot_error) if x)
+                WD_FAILED_IOCS.append(f"{ioc} | {snapshot_error}")
+            result_map[ioc] = info
+            if completed % WD_PROGRESS_INTERVAL == 0 or completed == len(malicious_iocs):
+                print(f"[+] wd urldb 快照查询进度：{completed}/{len(malicious_iocs)}")
     return result_map
 
 
@@ -1092,10 +1356,6 @@ def wfy_is_unknown(wfy_info: dict[str, Any]) -> bool:
         return True
     judge = normalize_cell(first_not_empty(wfy_info.get("judge"), wfy_info.get("verdict"), wfy_info.get("label"))).lower()
     return judge in {"", "unknown", "none", "null"}
-
-
-def wfy_has_no_result(wfy_info: dict[str, Any]) -> bool:
-    return not bool(wfy_info)
 
 
 def risk_is_black(risk: str) -> bool:
@@ -1233,7 +1493,7 @@ def collect_owner_candidates(
     wd_info: WdInfo,
     sc_malicious: bool = False,
 ) -> list[str]:
-    if wfy_has_no_result(wfy_info):
+    if not wfy_is_black(wfy_info):
         return ["unknown"]
     candidates = xmon_owner_candidates(xmon_info)
     if wd_info.malicious and wd_info.has_snapshot:
@@ -1425,13 +1685,12 @@ def decide_row(
     wd_snapshot, wd_topic = has_wd_malicious_snapshot(wd_info)
     decision.owner = classify_owner(xmon_info, wfy_info, wd_info, sc_malicious)
 
-    if wfy_is_white(wfy_info):
+    if not wfy_is_black(wfy_info):
         decision.k01_result = ""
-        decision.info_add = "wfy未报告恶意"
-        decision.false_positive_reason = "wfy未报告恶意"
+        decision.info_add = "wfy接口查询未显示恶意"
         decision.solvable = "否"
-        decision.solution = "wfy未报告恶意"
-        decision.rule_hit = "wfy_white"
+        decision.solution = "wfy接口查询未显示恶意"
+        decision.rule_hit = "wfy_not_black"
         decision.hit_rule = "wfy未报告恶意"
         return decision
 
@@ -1443,7 +1702,7 @@ def decide_row(
         decision.operating_system = black_hash_info.operating_system
         decision.create_time = black_hash_info.first_seen_time
         decision.other_file_feature = black_hash_info.other_file_feature
-        decision.info_add = f"{decision.result_ioc}，依据ioc({decision.result_ioc}),关联样本（{black_hash}）"
+        decision.info_add = f"{decision.ioc}，依据ioc({decision.ioc}),关联样本（{black_hash}）"
         decision.solvable = "能"
         decision.solution = "存在黑样本关联"
         decision.rule_hit = "black_hash"
@@ -1458,7 +1717,7 @@ def decide_row(
         decision.operating_system = first_hash_info.operating_system
         decision.create_time = first_hash_info.first_seen_time
         decision.other_file_feature = first_hash_info.other_file_feature
-        decision.info_add = f"{decision.result_ioc}，依据ioc({decision.result_ioc}),关联报告（{first_report}）"
+        decision.info_add = f"{decision.ioc}，依据ioc({decision.ioc}),关联报告（{first_report}）"
         decision.solvable = "能"
         decision.solution = "存在关联报告关联"
         decision.rule_hit = "report"
@@ -1494,18 +1753,8 @@ def decide_row(
             decision.hit_rule = "智能体证据链"
         return decision
 
-    if wfy_is_unknown(wfy_info):
-        decision.k01_result = "无效"
-        decision.info_add = "wfy接口查询显示未知"
-        decision.false_positive_reason = "wfy查不到"
-        decision.solvable = "否"
-        decision.solution = "wfy查不到"
-        decision.rule_hit = "wfy_unknown"
-        return decision
-
     if white_hash_seen:
         decision.k01_result = ""
-        decision.false_positive_reason = "文件情报为白"
         decision.solvable = "否"
         decision.solution = "文件情报为白，暂无有效证据"
         decision.rule_hit = "hash_white"
@@ -1551,7 +1800,7 @@ def print_debug_ioc(
 
 def decision_to_result_row(decision: RowDecision) -> dict[str, str]:
     return {
-        "IOC": decision.result_ioc,
+        "IOC": decision.ioc,
         "端口": decision.port,
         "厂商": decision.vendor,
         "外联日期": decision.out_date,
@@ -1568,7 +1817,7 @@ def decision_to_result_row(decision: RowDecision) -> dict[str, str]:
         "流量特征": "",
         "其他文件特征": decision.other_file_feature,
         "补充信息": decision.info_add,
-        "误报原因": decision.false_positive_reason,
+        "误报原因": "",
         "命中规则": decision.hit_rule,
     }
 
@@ -1585,59 +1834,39 @@ def decision_to_analysis_row(decision: RowDecision) -> dict[str, str]:
     }
 
 
-def owner_stats_templates(decisions: list[RowDecision]) -> dict[str, str]:
-    stats: dict[str, dict[str, int]] = {
-        owner: {"total": 0, "solved": 0, "unsolved": 0}
-        for owner in OWNER_PRIORITY
-    }
+def dedupe_decisions_by_ioc(decisions: list[RowDecision]) -> list[RowDecision]:
+    deduped: list[RowDecision] = []
+    seen: set[str] = set()
     for decision in decisions:
-        owner = decision.owner if decision.owner in stats else "unknown"
-        stats[owner]["total"] += 1
-        if decision.solvable == "能":
-            stats[owner]["solved"] += 1
-        else:
-            stats[owner]["unsolved"] += 1
-    return {
-        owner: f"{owner}量有{item['total']}，解决了{item['solved']}，{item['unsolved']}没解决"
-        for owner, item in stats.items()
-    }
-
-
-def apply_owner_stats_fallback(decisions: list[RowDecision], wfy_map: dict[str, dict[str, Any]]) -> None:
-    templates = owner_stats_templates(decisions)
-    updated = 0
-    for decision in decisions:
-        if decision.rule_hit != "no_more_evidence":
+        key = decision.ioc
+        if key and key in seen:
             continue
-        if not wfy_is_black(wfy_map.get(decision.ioc, {})):
-            continue
-        template = templates.get(decision.owner, templates["unknown"])
-        decision.info_add = template
-        decision.solution = template
-        updated += 1
-    if updated:
-        print(f"[+] 生产方统计话术回填：{updated} 条")
+        if key:
+            seen.add(key)
+        deduped.append(decision)
+    return deduped
 
 
 def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
+    deduped_decisions = dedupe_decisions_by_ioc(decisions)
     today_alert_count = len(decisions)
-    unique_ioc_count = len({decision.ioc for decision in decisions if decision.ioc})
-    unique_iocs = list(dict.fromkeys(decision.ioc for decision in decisions if decision.ioc))
+    unique_ioc_count = len({decision.ioc for decision in deduped_decisions if decision.ioc})
+    unique_iocs = list(dict.fromkeys(decision.ioc for decision in deduped_decisions if decision.ioc))
     wfy_black_count = sum(1 for ioc in unique_iocs if wfy_is_black(wfy_map.get(ioc, {})))
     wfy_non_black_count = len(unique_iocs) - wfy_black_count
 
-    black_hash_count = sum(1 for decision in decisions if decision.hit_rule == "存在黑样本关联")
-    report_count = sum(1 for decision in decisions if decision.hit_rule == "存在关联报告关联")
-    wd_snapshot_count = sum(1 for decision in decisions if decision.hit_rule == "src是wd且有快照")
-    ai_evidence_count = sum(1 for decision in decisions if decision.hit_rule == "智能体证据链")
+    black_hash_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "存在黑样本关联")
+    report_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "存在关联报告关联")
+    wd_snapshot_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "src是wd且有快照")
+    ai_evidence_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "智能体证据链")
 
     remaining_decisions = [
         decision
-        for decision in decisions
+        for decision in deduped_decisions
         if decision.rule_hit == "no_more_evidence" and wfy_is_black(wfy_map.get(decision.ioc, {}))
     ]
     remaining_count = len(remaining_decisions)
-    owner_counter = Counter(decision.owner if decision.owner in OWNER_PRIORITY else "unknown" for decision in decisions)
+    owner_counter = Counter(decision.owner if decision.owner in OWNER_PRIORITY else "unknown" for decision in deduped_decisions)
     owner_text = "，".join(
         f"{owner}（{owner_counter.get(owner, 0)}条）"
         for owner in ("atateam", "siyubo", "wd", "netlab", "unknown")
@@ -1805,19 +2034,17 @@ def main() -> None:
     stage_time = start_stage("查询 wfy")
     wfy_map = query_wfy(session, ioc_list)
     black_iocs = [ioc for ioc in ioc_list if wfy_is_black(wfy_map.get(ioc, {}))]
-    owner_candidate_iocs = [ioc for ioc in ioc_list if not wfy_has_no_result(wfy_map.get(ioc, {}))]
     print(f"[+] wfy black IOC：{len(black_iocs)} 条")
-    print(f"[+] 生产方归属候选 IOC：{len(owner_candidate_iocs)} 条")
     finish_stage("查询 wfy", stage_time)
 
     stage_time = start_stage("查询 sc")
-    sc_map = query_sc(session, owner_candidate_iocs) if owner_candidate_iocs else {}
+    sc_map = query_sc(session, black_iocs) if black_iocs else {}
     finish_stage("查询 sc", stage_time)
 
     stage_time = start_stage("查询 wd")
     wd_candidate_iocs = [
         ioc
-        for ioc in owner_candidate_iocs
+        for ioc in black_iocs
         if not {"atateam", "siyubo"}.intersection(xmon_owner_candidates(xmon_map.get(ioc, empty_xmon_info(ioc))))
     ]
     print(f"[+] wd 候选 IOC：{len(wd_candidate_iocs)} 条")
@@ -1858,12 +2085,12 @@ def main() -> None:
         decision = decide_row(row, xmon_info, hash_map, wfy_info, wd_info, ai_info, sc_malicious)
         print_debug_ioc(ioc, xmon_info, hash_map, wfy_info, wd_info, sc_malicious, decision)
         decisions.append(decision)
-    apply_owner_stats_fallback(decisions, wfy_map)
     finish_stage("生成研判结果", stage_time)
 
     stage_time = start_stage("写出 Excel")
-    result_df = pd.DataFrame([decision_to_result_row(d) for d in decisions], columns=RESULT_COLUMNS)
-    analysis_df = pd.DataFrame([decision_to_analysis_row(d) for d in decisions], columns=ANALYSIS_COLUMNS)
+    deduped_decisions = dedupe_decisions_by_ioc(decisions)
+    result_df = pd.DataFrame([decision_to_result_row(d) for d in deduped_decisions], columns=RESULT_COLUMNS)
+    analysis_df = pd.DataFrame([decision_to_analysis_row(d) for d in deduped_decisions], columns=ANALYSIS_COLUMNS)
     analysis_summary_df = pd.DataFrame(build_analysis_summary_rows(decisions, wfy_map), columns=ANALYSIS_SUMMARY_COLUMNS)
 
     write_excel_file(result_df, RESULT_FILE)
