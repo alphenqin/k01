@@ -91,6 +91,7 @@ AI_QUICK_ANALYSIS_HEADERS = {
     "Content-Type": "application/json",
     "X-AuthToken": XMON_TOKEN,
 }
+AI_KEY_EVIDENCE_DROP_TERMS = ("外部威胁情报", "威胁情报状态")
 
 # ===== 大模型公共配置 =====
 LLM_API_URL = os.getenv("K01_LLM_API_URL", "https://api.360.cn/v1/chat/completions")
@@ -104,6 +105,7 @@ SIYUBO_EVIDENCE_PROMPT = (
     "将evidence_chain中的detail汇总为50字以内的情报研判依据。"
     f"若出现无法研判相关词汇则总结为：{SIYUBO_NO_RESULT}。"
 )
+AI_NO_RESULT_TERMS = ("无法研判", "无法判断", "不能研判", "信息有限", "无对应研判结果", "信息不足", "空字符串")
 
 # ===== 性能控制配置 =====
 # 这些配置直接改脚本即可，不依赖环境变量。
@@ -1269,6 +1271,19 @@ def query_wd_safe_batch(batch: list[str]) -> tuple[list[str], dict[str, WdInfo],
         return batch, {ioc: WdInfo(ioc=ioc, query_error=error) for ioc in batch}, error
 
 
+def wd_snapshot_row_has_content(row: dict[str, Any]) -> bool:
+    return bool(first_not_empty(row.get("html"), row.get("snapshot")))
+
+
+def wd_snapshot_row_title(row: dict[str, Any]) -> str:
+    return first_not_empty(
+        row.get("title"),
+        row.get("page_title"),
+        row.get("html_title"),
+        row.get("site_title"),
+    )
+
+
 def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, str]:
     headers = {"X-Authtoken": WD_HISTORY_TOKEN}
     params = {"query": ioc, "time_start": WD_HISTORY_START}
@@ -1284,16 +1299,19 @@ def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, st
         rows = data.get("data") if isinstance(data, dict) else []
         if not isinstance(rows, list):
             return False, "", "wd history data is not list"
+        snapshot_rows: list[dict[str, Any]] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            html = normalize_cell(row.get("html", ""))
-            snapshot = normalize_cell(row.get("snapshot", ""))
-            if not html and not snapshot:
-                continue
-            topic = first_not_empty(row.get("title"), row.get("url"))
-            return True, topic, ""
-        return False, "", ""
+            if wd_snapshot_row_has_content(row):
+                snapshot_rows.append(row)
+        if not snapshot_rows:
+            return False, "", ""
+        topic = first_not_empty(
+            *(wd_snapshot_row_title(row) for row in snapshot_rows),
+            *(row.get("url") for row in snapshot_rows),
+        )
+        return True, topic, ""
     except Exception as exc:
         return False, "", str(exc)
 
@@ -1549,6 +1567,8 @@ def xmon_owner_candidates(xmon_info: XmonInfo) -> list[str]:
             candidates.append("atateam")
         if "siyubo" in value:
             candidates.append("siyubo")
+        if "wd" in value:
+            candidates.append("wd")
         if "btmon" in value or is_url_src(value):
             candidates.append("netlab")
     return list(dict.fromkeys(candidates))
@@ -1669,6 +1689,18 @@ def normalize_siyubo_llm_summary(summary: str) -> str:
     return text[:50]
 
 
+def normalize_ai_llm_summary(summary: str) -> str:
+    text = normalize_cell(summary)
+    if not text:
+        return ""
+    text = re.sub(r"^```(?:text)?", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    text = text.strip("\"'“”‘’")
+    if any(term in text for term in AI_NO_RESULT_TERMS):
+        return ""
+    return text[:50]
+
+
 def parse_llm_summary_response(data: Any) -> str:
     if not isinstance(data, dict):
         return ""
@@ -1695,6 +1727,33 @@ def parse_llm_summary_response(data: Any) -> str:
     return ""
 
 
+def query_llm_chat_summary(payload: dict[str, Any]) -> tuple[str, str]:
+    if not LLM_TOKEN:
+        return "", "missing LLM_TOKEN"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LLM_TOKEN}",
+    }
+    last_error = ""
+    max_attempts = LLM_RETRIES + 1
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            time.sleep(LLM_RETRY_SLEEP_SECONDS * (attempt - 1))
+        try:
+            session = get_thread_session()
+            resp = session.post(
+                LLM_API_URL,
+                headers=headers,
+                data=json_utf8_body(payload),
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            return parse_llm_summary_response(safe_json_response(resp)), ""
+        except Exception as exc:
+            last_error = str(exc)
+    return "", last_error
+
+
 def query_siyubo_llm_summary_one(ioc: str, details: list[str]) -> tuple[str, str, str]:
     if not LLM_TOKEN:
         return ioc, "", "missing LLM_TOKEN"
@@ -1718,30 +1777,8 @@ def query_siyubo_llm_summary_one(ioc: str, details: list[str]) -> tuple[str, str
         "temperature": 0,
         "max_tokens": 120,
     }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LLM_TOKEN}",
-    }
-
-    last_error = ""
-    max_attempts = LLM_RETRIES + 1
-    for attempt in range(1, max_attempts + 1):
-        if attempt > 1:
-            time.sleep(LLM_RETRY_SLEEP_SECONDS * (attempt - 1))
-        try:
-            session = get_thread_session()
-            resp = session.post(
-                LLM_API_URL,
-                headers=headers,
-                data=json_utf8_body(payload),
-                timeout=REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
-            summary = normalize_siyubo_llm_summary(parse_llm_summary_response(safe_json_response(resp)))
-            return ioc, summary, ""
-        except Exception as exc:
-            last_error = str(exc)
-    return ioc, "", last_error
+    summary, error = query_llm_chat_summary(payload)
+    return ioc, normalize_siyubo_llm_summary(summary), error
 
 
 def query_siyubo_llm_summaries(evidence_map: dict[str, list[str]]) -> dict[str, str]:
@@ -1834,9 +1871,80 @@ def query_ai_quick_analysis_one(ioc: str) -> AiInfo:
     filtered = [
         normalize_cell(item)
         for item in key_evidence
-        if normalize_cell(item) and "外部威胁情报显示" not in normalize_cell(item)
+        if normalize_cell(item) and not any(term in normalize_cell(item) for term in AI_KEY_EVIDENCE_DROP_TERMS)
     ]
-    return AiInfo(ioc=ioc, key_evidence=filtered, summary=summarize_evidence_details(filtered))
+    return AiInfo(ioc=ioc, key_evidence=filtered)
+
+
+def query_ai_evidence_llm_summary_one(ioc: str, details: list[str]) -> tuple[str, str, str]:
+    cleaned_details = [normalize_cell(detail) for detail in details if normalize_cell(detail)]
+    if not cleaned_details:
+        return ioc, "", ""
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": "你是安全情报分析助手，只输出最终研判依据，不要解释。"},
+            {
+                "role": "user",
+                "content": (
+                    "以下是已删除噪声关键词后的智能体 key_evidence。"
+                    "请汇总为50字以内的情报研判依据。"
+                    "若信息不足以形成依据，请返回空字符串。\n\n"
+                    "key_evidence如下：\n"
+                    + "\n".join(f"- {detail}" for detail in cleaned_details)
+                ),
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 120,
+    }
+    summary, error = query_llm_chat_summary(payload)
+    return ioc, normalize_ai_llm_summary(summary), error
+
+
+def enrich_ai_infos_with_llm_summaries(result_map: dict[str, AiInfo]) -> dict[str, AiInfo]:
+    candidates = {ioc: info.key_evidence for ioc, info in result_map.items() if info.key_evidence}
+    if not candidates:
+        return result_map
+    if not LLM_TOKEN:
+        print("[!] 未配置 LLM_TOKEN，跳过智能体证据链大模型总结。")
+        return result_map
+
+    print(f"[+] 智能体证据链大模型总结待处理：{len(candidates)} 条，并发数 {min(LLM_WORKERS, len(candidates))}")
+    if LLM_WORKERS <= 1 or len(candidates) == 1:
+        for index, (ioc, details) in enumerate(candidates.items(), 1):
+            _, summary, error = query_ai_evidence_llm_summary_one(ioc, details)
+            if error:
+                AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
+            if summary:
+                result_map[ioc].summary = summary
+            if index % AI_PROGRESS_INTERVAL == 0 or index == len(candidates):
+                print(f"[+] 智能体证据链大模型总结进度：{index}/{len(candidates)}")
+            time.sleep(SLEEP_SECONDS)
+        return result_map
+
+    worker_count = min(LLM_WORKERS, len(candidates))
+    completed = 0
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(query_ai_evidence_llm_summary_one, ioc, details): ioc
+            for ioc, details in candidates.items()
+        }
+        for future in as_completed(future_map):
+            ioc = future_map[future]
+            completed += 1
+            try:
+                _, summary, error = future.result()
+            except Exception as exc:
+                summary = ""
+                error = str(exc)
+            if error:
+                AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
+            if summary:
+                result_map[ioc].summary = summary
+            if completed % AI_PROGRESS_INTERVAL == 0 or completed == len(candidates):
+                print(f"[+] 智能体证据链大模型总结进度：{completed}/{len(candidates)}")
+    return result_map
 
 
 def query_ai_quick_analysis(ioc_list: list[str]) -> dict[str, AiInfo]:
@@ -1854,7 +1962,7 @@ def query_ai_quick_analysis(ioc_list: list[str]) -> dict[str, AiInfo]:
             if index % AI_PROGRESS_INTERVAL == 0 or index == len(unique_iocs):
                 print(f"[+] 智能体证据链查询进度：{index}/{len(unique_iocs)}")
             time.sleep(SLEEP_SECONDS)
-        return result_map
+        return enrich_ai_infos_with_llm_summaries(result_map)
 
     worker_count = min(AI_WORKERS, len(unique_iocs))
     completed = 0
@@ -1872,7 +1980,7 @@ def query_ai_quick_analysis(ioc_list: list[str]) -> dict[str, AiInfo]:
             result_map[ioc] = info
             if completed % AI_PROGRESS_INTERVAL == 0 or completed == len(unique_iocs):
                 print(f"[+] 智能体证据链查询进度：{completed}/{len(unique_iocs)}")
-    return result_map
+    return enrich_ai_infos_with_llm_summaries(result_map)
 
 
 def has_black_hash_evidence(xmon_info: XmonInfo, hash_map: dict[str, HashInfo]) -> bool:
