@@ -291,6 +291,10 @@ def stringify(value: Any) -> str:
     return str(value)
 
 
+def json_utf8_body(value: Any, **kwargs: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, **kwargs).encode("utf-8")
+
+
 def normalize_cell(value: Any) -> str:
     text = stringify(value).strip()
     if text in {"--", "nan", "NaN", "None"}:
@@ -861,7 +865,7 @@ def query_hash_batch(session: Session, hash_list: list[str]) -> Any:
         resp = session.post(
             HASH_API_URL,
             headers=make_ti_headers(),
-            data=json.dumps(payload, ensure_ascii=False),
+            data=json_utf8_body(payload),
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
@@ -977,7 +981,7 @@ def query_wfy_batch(batch: list[str]) -> tuple[list[str], dict[str, dict[str, An
             resp = session.post(
                 WFY_API_URL,
                 headers=WFY_HEADERS,
-                data=json.dumps(batch, ensure_ascii=False),
+                data=json_utf8_body(batch),
                 timeout=REQUEST_TIMEOUT,
             )
             if resp.status_code == 429 and attempt < max_attempts:
@@ -1105,7 +1109,7 @@ def query_custom_tags_batch(
         resp = session.post(
             TAGS_API_URL,
             headers=make_ti_headers(),
-            data=json.dumps(payload, ensure_ascii=False),
+            data=json_utf8_body(payload),
             timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
@@ -1233,7 +1237,7 @@ def query_wd_safe_batch(batch: list[str]) -> tuple[list[str], dict[str, WdInfo],
         session = get_thread_session()
         resp = session.post(
             WD_SAFE_API_URL,
-            data=body,
+            data=body.encode("utf-8"),
             headers=make_wd_safe_headers(body),
             timeout=REQUEST_TIMEOUT,
         )
@@ -1729,7 +1733,7 @@ def query_siyubo_llm_summary_one(ioc: str, details: list[str]) -> tuple[str, str
             resp = session.post(
                 LLM_API_URL,
                 headers=headers,
-                data=json.dumps(payload, ensure_ascii=False),
+                data=json_utf8_body(payload),
                 timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
@@ -1812,7 +1816,7 @@ def query_ai_quick_analysis_one(ioc: str) -> AiInfo:
             resp = session.post(
                 AI_QUICK_ANALYSIS_URL,
                 headers=AI_QUICK_ANALYSIS_HEADERS,
-                data=json.dumps(payload, ensure_ascii=False),
+                data=json_utf8_body(payload),
                 timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
