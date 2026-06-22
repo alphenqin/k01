@@ -1270,7 +1270,7 @@ def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, st
             snapshot = normalize_cell(row.get("snapshot", ""))
             if not html and not snapshot:
                 continue
-            topic = first_not_empty(row.get("title"), row.get("url"), row.get("domain"), ioc)
+            topic = first_not_empty(row.get("title"), row.get("url"))
             return True, topic, ""
         return False, "", ""
     except Exception as exc:
@@ -1571,6 +1571,31 @@ def has_wd_malicious_snapshot(wd_info: WdInfo) -> tuple[bool, str]:
     return wd_info.malicious and wd_info.has_snapshot, wd_info.snapshot_topic
 
 
+def extract_xmon_description(xmon_info: XmonInfo) -> str:
+    raw = xmon_info.raw if isinstance(xmon_info.raw, dict) else {}
+    tag_main = raw.get("tag_main") if isinstance(raw.get("tag_main"), dict) else {}
+    description = first_not_empty(tag_main.get("description"))
+    if description:
+        return description
+
+    child_rows = raw.get("__tagmon_children")
+    if isinstance(child_rows, list):
+        for child in child_rows:
+            if not isinstance(child, dict):
+                continue
+            exts = child.get("exts") if isinstance(child.get("exts"), dict) else {}
+            ioctag = exts.get("ioctag") if isinstance(exts.get("ioctag"), dict) else {}
+            description = first_not_empty(ioctag.get("description"))
+            if description:
+                return description
+    return ""
+
+
+def format_wd_snapshot_info_add(description: str, topic: str) -> str:
+    description_json = json.dumps({"description": normalize_cell(description)}, ensure_ascii=False)
+    return f"内容类存在恶意快照的ioc,{description_json}（{topic}）"
+
+
 def summarize_evidence_details(details: list[str], limit: int = 50) -> str:
     cleaned: list[str] = []
     for detail in details:
@@ -1780,8 +1805,9 @@ def decide_row(
 
     if decision.owner == "wd" and wd_snapshot:
         topic = wd_topic or decision.result_ioc
+        description = extract_xmon_description(xmon_info)
         decision.k01_result = "有效"
-        decision.info_add = f"内容类，存在恶意快照的ioc({topic})"
+        decision.info_add = format_wd_snapshot_info_add(description, topic)
         decision.solvable = "能"
         decision.solution = "src是wd且有快照"
         decision.rule_hit = "wd_snapshot"
