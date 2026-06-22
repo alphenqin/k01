@@ -445,6 +445,36 @@ def extract_xmon_disable(row: dict[str, Any], raw: dict[str, Any]) -> str:
     return ""
 
 
+def extract_main_report_link_values(row: dict[str, Any]) -> list[Any]:
+    values: list[Any] = []
+    value = row.get("report_links")
+    if has_meaningful_value(value):
+        values.append(value)
+    return values
+
+
+def extract_child_report_link_values(row: dict[str, Any]) -> list[Any]:
+    values: list[Any] = []
+    exts = row.get("exts") if isinstance(row.get("exts"), dict) else {}
+    value = exts.get("report_link")
+    if has_meaningful_value(value):
+        values.append(value)
+    return values
+
+
+def collect_xmon_report_links(row: dict[str, Any]) -> list[Any]:
+    values = extract_main_report_link_values(row)
+    if values:
+        return values
+
+    child_rows = row.get("__tagmon_children")
+    if isinstance(child_rows, list):
+        for child in child_rows:
+            if isinstance(child, dict):
+                values.extend(extract_child_report_link_values(child))
+    return values
+
+
 def normalize_xmon_row(ioc: str, row: dict[str, Any]) -> XmonInfo:
     raw = row.get("Raw") if isinstance(row.get("Raw"), dict) else {}
     return XmonInfo(
@@ -452,7 +482,7 @@ def normalize_xmon_row(ioc: str, row: dict[str, Any]) -> XmonInfo:
         disable=extract_xmon_disable(row, raw),
         status=first_not_empty(row.get("status"), row.get("Status"), raw.get("status"), raw.get("Status")),
         ref_sample=row.get("ref_sample", ""),
-        report_links=first_raw_not_empty(row.get("report_links"), raw.get("report_links")),
+        report_links=collect_xmon_report_links(row),
         raw=row,
     )
 
@@ -1397,8 +1427,34 @@ def split_report_links(report_links: Any) -> list[str]:
     return list(dict.fromkeys(links))
 
 
+REPORT_URL_RE = re.compile(r"https?://[^\s\"'<>，；、（）()]+")
+
+
+def extract_report_urls(value: Any) -> list[str]:
+    data = parse_literal_or_json(value)
+    if isinstance(data, dict):
+        values = list(data.keys()) + list(data.values())
+    elif isinstance(data, list):
+        values = data
+    else:
+        values = [data]
+
+    urls: list[str] = []
+    for item in values:
+        if isinstance(item, (dict, list)):
+            urls.extend(extract_report_urls(item))
+            continue
+        text = stringify(item)
+        for match in REPORT_URL_RE.findall(text):
+            url = normalize_report_url(match)
+            parsed = urlparse(url)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                urls.append(url)
+    return list(dict.fromkeys(urls))
+
+
 def normalize_report_url(url: str) -> str:
-    text = normalize_cell(url)
+    text = normalize_cell(url).rstrip(".,;，；。")
     if not text:
         return ""
     if text.startswith(("http://", "https://")) and "#" in text:
@@ -1407,10 +1463,8 @@ def normalize_report_url(url: str) -> str:
 
 
 def pick_first_report(report_links: Any) -> str:
-    for link in split_report_links(report_links):
-        normalized = normalize_report_url(link)
-        if normalized:
-            return normalized
+    for url in extract_report_urls(report_links):
+        return url
     return ""
 
 
