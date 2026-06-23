@@ -2339,6 +2339,7 @@ def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str,
     ]
     remaining_count = len(remaining_decisions)
     owner_counter = Counter(decision.owner if decision.owner in OWNER_PRIORITY else "unknown" for decision in deduped_decisions)
+    owner_total = sum(owner_counter.get(owner, 0) for owner in OWNER_PRIORITY)
     owner_text = "，".join(
         f"{owner}（{owner_counter.get(owner, 0)}条）"
         for owner in ("atateam", "siyubo", "wd", "netlab", "unknown")
@@ -2353,7 +2354,7 @@ def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str,
         f"wd存在快照{wd_snapshot_count}",
         f"智能体证据链{ai_evidence_count}",
         f"还剩余{remaining_count}条ioc",
-        f"生产方归属总计{today_alert_count}条，{owner_text}",
+        f"拼接ioc去重后生产方归属总计{owner_total}条，{owner_text}",
     ]
     return [{"序号": str(index), "统计信息": line} for index, line in enumerate(lines, 1)]
 
