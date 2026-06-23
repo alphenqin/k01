@@ -141,11 +141,11 @@ WD_WORKERS = 12  # wd 查询并发数；safe 评分按批次并发，恶意 IOC 
 WD_SAFE_BATCH_SIZE = 20  # wd safe 评分接口每批 IOC 数。
 WD_SAFE_MAX_BATCH_SIZE = 20  # wd safe 评分接口允许的最大批量；第 21 条起会被接口静默截断。
 WD_PROGRESS_INTERVAL = 100  # wd 每处理多少条 IOC 打印一次进度。
-AI_WORKERS = 50  # 智能体证据链接口并发数；接口不支持批量，过高容易 500/502/超时。
+AI_WORKERS = 40  # 智能体证据链接口并发数；接口不支持批量，过高容易 500/502/超时。
 AI_PROGRESS_INTERVAL = 100  # 智能体证据链每处理多少条 IOC 打印一次进度。
 AI_RETRIES = 3  # 智能体证据链接口失败后的重试次数。
 AI_RETRY_SLEEP_SECONDS = 5.0  # 智能体证据链重试退避基准秒数；实际等待按 5、10、15... 递增。
-LLM_WORKERS = 50  # 大模型接口并发数；外部模型接口不宜过高。
+LLM_WORKERS = 48  # 大模型接口并发数；外部模型接口不宜过高。
 LLM_RETRIES = 2  # 大模型接口失败后的重试次数。
 LLM_RETRY_SLEEP_SECONDS = 2.0  # 大模型接口重试等待秒数。
 SLEEP_SECONDS = 0.05  # 串行分支中每次请求后的短暂停顿，降低接口压力。
@@ -1282,7 +1282,31 @@ def query_wd_safe_batch(batch: list[str]) -> tuple[list[str], dict[str, WdInfo],
 
 
 def wd_snapshot_row_has_content(row: dict[str, Any]) -> bool:
-    return bool(first_not_empty(row.get("html"), row.get("snapshot")))
+    title = wd_snapshot_row_title(row)
+    content = wd_snapshot_row_content(row)
+    return bool(content) and not wd_snapshot_is_error_page(title, content)
+
+
+def wd_snapshot_is_error_page(title: str, content: str) -> bool:
+    text = normalize_cell(f"{title} {content}").lower()
+    if not text:
+        return False
+    error_terms = (
+        "403 forbidden",
+        "404 not found",
+        "400 bad request",
+        "401 unauthorized",
+        "502 bad gateway",
+        "503 service temporarily unavailable",
+        "504 gateway timeout",
+        "access denied",
+        "forbidden",
+        "not found",
+    )
+    if any(term in text for term in error_terms):
+        server_terms = ("nginx", "apache", "iis", "openresty", "cloudflare")
+        return any(term in text for term in server_terms) or len(text) < 300
+    return False
 
 
 def wd_snapshot_row_title(row: dict[str, Any]) -> str:
