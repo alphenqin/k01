@@ -1981,7 +1981,7 @@ def query_ai_evidence_llm_summary_one(ioc: str, details: list[str]) -> tuple[str
                 "role": "user",
                 "content": (
                     "以下是已删除噪声关键词后的智能体 key_evidence。"
-                    "请汇总为50字以内的情报研判依据。"
+                    "请汇总为一句完整的情报研判依据，长度50字左右，不要输出半句话或泛化短语。"
                     "若信息不足以形成依据，请返回空字符串。\n\n"
                     "key_evidence如下：\n"
                     + "\n".join(f"- {detail}" for detail in cleaned_details)
