@@ -141,11 +141,11 @@ WD_WORKERS = 12  # wd 查询并发数；safe 评分按批次并发，恶意 IOC 
 WD_SAFE_BATCH_SIZE = 20  # wd safe 评分接口每批 IOC 数。
 WD_SAFE_MAX_BATCH_SIZE = 20  # wd safe 评分接口允许的最大批量；第 21 条起会被接口静默截断。
 WD_PROGRESS_INTERVAL = 100  # wd 每处理多少条 IOC 打印一次进度。
-AI_WORKERS = 40  # 智能体证据链接口并发数；接口不支持批量，过高容易 500/502/超时。
+AI_WORKERS = 32  # 智能体证据链接口并发数；接口不支持批量，过高容易 500/502/超时。
 AI_PROGRESS_INTERVAL = 100  # 智能体证据链每处理多少条 IOC 打印一次进度。
 AI_RETRIES = 3  # 智能体证据链接口失败后的重试次数。
 AI_RETRY_SLEEP_SECONDS = 5.0  # 智能体证据链重试退避基准秒数；实际等待按 5、10、15... 递增。
-LLM_WORKERS = 48  # 大模型接口并发数；外部模型接口不宜过高。
+LLM_WORKERS = 24  # 大模型接口并发数；外部模型接口不宜过高。
 LLM_RETRIES = 2  # 大模型接口失败后的重试次数。
 LLM_RETRY_SLEEP_SECONDS = 2.0  # 大模型接口重试等待秒数。
 SLEEP_SECONDS = 0.05  # 串行分支中每次请求后的短暂停顿，降低接口压力。
@@ -2135,16 +2135,12 @@ def decide_row(
     first_hash_info = HashInfo(query_hash=ref_hashes[0]) if ref_hashes else HashInfo()
     black_hash = ""
     black_hash_info = HashInfo()
-    white_hash_seen = False
-
     for ref_hash in ref_hashes:
         hash_info = hash_map.get(ref_hash, HashInfo(query_hash=ref_hash))
         if risk_is_black(hash_info.risk):
             black_hash = ref_hash
             black_hash_info = hash_info
             break
-        elif risk_is_white(hash_info.risk):
-            white_hash_seen = True
         if not first_hash_info.risk:
             first_hash_info = hash_info
 
@@ -2222,13 +2218,6 @@ def decide_row(
         decision.solution = "智能体证据链"
         decision.rule_hit = "ai_evidence_chain"
         decision.hit_rule = "智能体证据链"
-        return finalize_decision(decision)
-
-    if white_hash_seen:
-        decision.k01_result = ""
-        decision.solvable = "否"
-        decision.solution = "文件情报为白，暂无有效证据"
-        decision.rule_hit = "hash_white"
         return finalize_decision(decision)
 
     decision.k01_result = ""
