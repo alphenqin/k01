@@ -179,6 +179,8 @@ RESULT_COLUMNS = [
 
 ANALYSIS_COLUMNS = ["ioc外联目标", "端口", "厂商", "ioc", "生产方归属", "能否解决", "相关解决方案"]
 ANALYSIS_SUMMARY_COLUMNS = ["序号", "统计信息"]
+ANALYSIS_OWNER_SHEETS = ["atateam", "siyubo", "wd", "netlab", "unknown"]
+AI_EVIDENCE_PROBLEM_TEXT = "无对应上下文支持；如关联样本，关联报告，生产方式，排查指引，站点主题等"
 
 BLACK_RISKS = {"critical", "high", "medium", "low"}
 WHITE_RISKS = {"safe"}
@@ -2084,7 +2086,37 @@ def query_ai_quick_analysis(ioc_list: list[str]) -> dict[str, AiInfo]:
         print("[!] 未配置 LLM_TOKEN，跳过智能体证据链大模型总结。")
 
     completed = 0
+    llm_completed = 0
     llm_future_map: dict[Any, str] = {}
+
+    def print_ai_pipeline_progress(force: bool = False) -> None:
+        llm_submitted = llm_completed + len(llm_future_map)
+        if force or completed % AI_PROGRESS_INTERVAL == 0 or completed == len(unique_iocs):
+            print(
+                f"[+] 智能体证据链完成 {completed}/{len(unique_iocs)}，"
+                f"大语言模型总结已提交 {llm_submitted}，"
+                f"大语言模型总结已完成 {llm_completed}"
+            )
+
+    def collect_llm_future(future: Any, ioc: str) -> None:
+        nonlocal llm_completed
+        llm_completed += 1
+        try:
+            _, summary, error = future.result()
+        except Exception as exc:
+            summary = ""
+            error = str(exc)
+        if error:
+            AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
+        if summary:
+            result_map[ioc].summary = summary
+
+    def collect_completed_llm_results() -> None:
+        for llm_future, ioc in list(llm_future_map.items()):
+            if not llm_future.done():
+                continue
+            collect_llm_future(llm_future, ioc)
+            del llm_future_map[llm_future]
 
     def collect_ai_results(llm_executor: ThreadPoolExecutor | None = None) -> None:
         nonlocal completed
@@ -2103,31 +2135,19 @@ def query_ai_quick_analysis(ioc_list: list[str]) -> dict[str, AiInfo]:
                 if llm_executor and info.key_evidence:
                     llm_future = llm_executor.submit(query_ai_evidence_llm_summary_one, ioc, info.key_evidence)
                     llm_future_map[llm_future] = ioc
-                if completed % AI_PROGRESS_INTERVAL == 0 or completed == len(unique_iocs):
-                    print(f"[+] 智能体证据链查询进度：{completed}/{len(unique_iocs)}")
+                collect_completed_llm_results()
+                print_ai_pipeline_progress()
 
     if LLM_TOKEN:
         print(f"[+] 智能体证据链大模型总结采用流水线，并发数 {llm_worker_count}")
         with ThreadPoolExecutor(max_workers=llm_worker_count) as llm_executor:
             collect_ai_results(llm_executor)
-            llm_total = len(llm_future_map)
-            if llm_total:
-                print(f"[+] 智能体证据链大模型总结待处理：{llm_total} 条")
-            llm_completed = 0
-            for future in as_completed(llm_future_map):
-                ioc = llm_future_map[future]
-                llm_completed += 1
-                try:
-                    _, summary, error = future.result()
-                except Exception as exc:
-                    summary = ""
-                    error = str(exc)
-                if error:
-                    AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
-                if summary:
-                    result_map[ioc].summary = summary
-                if llm_total and (llm_completed % AI_PROGRESS_INTERVAL == 0 or llm_completed == llm_total):
-                    print(f"[+] 智能体证据链大模型总结进度：{llm_completed}/{llm_total}")
+            print_ai_pipeline_progress(force=True)
+            for future in as_completed(list(llm_future_map)):
+                ioc = llm_future_map.pop(future)
+                collect_llm_future(future, ioc)
+                if llm_completed % AI_PROGRESS_INTERVAL == 0 or not llm_future_map:
+                    print_ai_pipeline_progress(force=True)
     else:
         collect_ai_results()
     return result_map
@@ -2358,7 +2378,7 @@ def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str,
         f"{owner}（{owner_counter.get(owner, 0)}条）"
         for owner in ("atateam", "siyubo", "wd", "netlab", "unknown")
     )
-    non_ai_decisions = [decision for decision in deduped_decisions if decision.hit_rule != "智能体证据链"]
+    non_ai_decisions = [decision for decision in deduped_decisions if decision.solution != "智能体证据链"]
     non_ai_owner_counter = Counter(decision.owner if decision.owner in OWNER_PRIORITY else "unknown" for decision in non_ai_decisions)
     non_ai_owner_total = sum(non_ai_owner_counter.get(owner, 0) for owner in OWNER_PRIORITY)
     non_ai_owner_text = "，".join(
@@ -2376,7 +2396,8 @@ def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str,
         f"智能体证据链{ai_evidence_count}",
         f"还剩余{remaining_count}条ioc",
         f"拼接ioc去重后生产方归属总计{owner_total}条，{owner_text}",
-        f"拼接ioc去重后，排除智能体证据链后，生产方归属总计{non_ai_owner_total}/{owner_total}条，{non_ai_owner_text}",
+        f"拼接ioc去重后，排除智能体证据链后，生产方归属总计{non_ai_owner_total}/{owner_total}条；\n"
+        f"生产方对应已解决情况：{non_ai_owner_text}；",
     ]
     return [{"序号": str(index), "统计信息": line} for index, line in enumerate(lines, 1)]
 
@@ -2479,11 +2500,24 @@ def write_excel_file(df: pd.DataFrame, path: str) -> None:
         raise PermissionError(f"无法写入输出文件：{path}。请先关闭 Excel/WPS 中打开的该文件后重试。") from exc
 
 
+def build_analysis_owner_ai_sheet(detail_df: pd.DataFrame, owner: str) -> pd.DataFrame:
+    filtered = detail_df[
+        (detail_df["生产方归属"] == owner)
+        & (detail_df["相关解决方案"] == "智能体证据链")
+    ].copy()
+    filtered["能否解决"] = AI_EVIDENCE_PROBLEM_TEXT
+    filtered = filtered.rename(columns={"能否解决": "问题情况"})
+    return filtered.drop(columns=["相关解决方案"])
+
+
 def write_analysis_excel(detail_df: pd.DataFrame, summary_df: pd.DataFrame, path: str) -> None:
     try:
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             detail_df.to_excel(writer, sheet_name="明细", index=False)
             summary_df.to_excel(writer, sheet_name="统计", index=False)
+            for owner in ANALYSIS_OWNER_SHEETS:
+                owner_df = build_analysis_owner_ai_sheet(detail_df, owner)
+                owner_df.to_excel(writer, sheet_name=owner, index=False)
     except PermissionError as exc:
         raise PermissionError(f"无法写入输出文件：{path}。请先关闭 Excel/WPS 中打开的该文件后重试。") from exc
 
