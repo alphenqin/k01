@@ -1677,6 +1677,16 @@ def format_wd_snapshot_info_add(description: str, topic: str) -> str:
     return f"内容类存在恶意快照的ioc,描述信息：{description}，主题内容：{topic}"
 
 
+def finalize_decision(decision: RowDecision) -> RowDecision:
+    if decision.solution == "无更多依据关联":
+        decision.solvable = "否"
+    elif decision.solution == "存在黑样本关联":
+        decision.solvable = "能"
+    else:
+        decision.solvable = "预解决"
+    return decision
+
+
 def summarize_evidence_details(details: list[str], limit: int = 50) -> str:
     cleaned: list[str] = []
     for detail in details:
@@ -2112,7 +2122,7 @@ def decide_row(
         decision.solution = "wfy接口查询未显示恶意"
         decision.rule_hit = "wfy_not_black"
         decision.hit_rule = "wfy未报告恶意"
-        return decision
+        return finalize_decision(decision)
 
     if black_hash:
         decision.k01_result = "有效"
@@ -2127,7 +2137,7 @@ def decide_row(
         decision.solution = "存在黑样本关联"
         decision.rule_hit = "black_hash"
         decision.hit_rule = "存在黑样本关联"
-        return decision
+        return finalize_decision(decision)
 
     if first_report:
         decision.k01_result = "有效"
@@ -2142,7 +2152,7 @@ def decide_row(
         decision.solution = "存在关联报告关联"
         decision.rule_hit = "report"
         decision.hit_rule = "存在关联报告关联"
-        return decision
+        return finalize_decision(decision)
 
     if decision.owner == "wd" and wd_snapshot:
         description = extract_xmon_description(xmon_info)
@@ -2155,7 +2165,7 @@ def decide_row(
             decision.solution = "src是wd且有快照"
             decision.rule_hit = "wd_snapshot"
             decision.hit_rule = "src是wd且有快照"
-            return decision
+            return finalize_decision(decision)
 
     if decision.owner == "siyubo":
         evidence_summary = normalize_cell(siyubo_evidence_summary)
@@ -2166,7 +2176,7 @@ def decide_row(
             decision.solution = "siyubo证据链"
             decision.rule_hit = "siyubo_evidence_chain"
             decision.hit_rule = "siyubo证据链"
-            return decision
+            return finalize_decision(decision)
         if ai_info and ai_info.summary:
             decision.k01_result = "有效"
             decision.info_add = ai_info.summary
@@ -2174,20 +2184,20 @@ def decide_row(
             decision.solution = "智能体证据链"
             decision.rule_hit = "ai_evidence_chain"
             decision.hit_rule = "智能体证据链"
-        return decision
+        return finalize_decision(decision)
 
     if white_hash_seen:
         decision.k01_result = ""
         decision.solvable = "否"
         decision.solution = "文件情报为白，暂无有效证据"
         decision.rule_hit = "hash_white"
-        return decision
+        return finalize_decision(decision)
 
     decision.k01_result = ""
     decision.solvable = "否"
     decision.solution = "无更多依据关联"
     decision.rule_hit = "no_more_evidence"
-    return decision
+    return finalize_decision(decision)
 
 
 def print_debug_ioc(
