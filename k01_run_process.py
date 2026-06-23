@@ -107,6 +107,9 @@ SIYUBO_EVIDENCE_PROMPT = (
     f"若出现无法研判相关词汇则总结为：{SIYUBO_NO_RESULT}。"
 )
 AI_NO_RESULT_TERMS = ("无法研判", "无法判断", "不能研判", "信息有限", "无对应研判结果", "信息不足", "空字符串")
+AI_SUMMARY_MIN_CHARS = 15
+AI_GENERIC_SUMMARIES = {"360标记", "360威胁情报", "高危域名", "恶意域名", "威胁情报"}
+AI_COMPLETE_SUMMARY_ENDINGS = ("。", "！", "？", ".", "!", "?")
 
 # ===== 性能控制配置 =====
 # 这些配置直接改脚本即可，不依赖环境变量。
@@ -1753,6 +1756,10 @@ def normalize_ai_llm_summary(summary: str) -> str:
     text = text.strip("\"'“”‘’")
     if any(term in text for term in AI_NO_RESULT_TERMS):
         return ""
+    if text in AI_GENERIC_SUMMARIES or len(text) < AI_SUMMARY_MIN_CHARS:
+        return ""
+    if not text.endswith(AI_COMPLETE_SUMMARY_ENDINGS):
+        return ""
     return text
 
 
@@ -1981,7 +1988,7 @@ def query_ai_evidence_llm_summary_one(ioc: str, details: list[str]) -> tuple[str
                 "role": "user",
                 "content": (
                     "以下是已删除噪声关键词后的智能体 key_evidence。"
-                    "请汇总为一句完整的情报研判依据，长度50字左右，不要输出半句话或泛化短语。"
+                    "请汇总为一句完整的情报研判依据，长度50字左右，必须以句号结尾，不要输出半句话或泛化短语。"
                     "若信息不足以形成依据，请返回空字符串。\n\n"
                     "key_evidence如下：\n"
                     + "\n".join(f"- {detail}" for detail in cleaned_details)
