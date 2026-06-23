@@ -91,7 +91,7 @@ AI_QUICK_ANALYSIS_HEADERS = {
     "Content-Type": "application/json",
     "X-AuthToken": XMON_TOKEN,
 }
-AI_KEY_EVIDENCE_DROP_TERMS = ("外部威胁情报", "威胁情报状态")
+AI_KEY_EVIDENCE_DROP_TERMS = ("外部威胁情报", "威胁情报状态", "外部")
 
 # ===== 大模型公共配置 =====
 LLM_API_URL = os.getenv("K01_LLM_API_URL", "https://api.360.cn/v1/chat/completions")
@@ -2553,7 +2553,7 @@ def main() -> None:
 
     stage_time = start_stage("写出 Excel")
     deduped_decisions = dedupe_decisions_by_ioc(decisions)
-    result_df = pd.DataFrame([decision_to_result_row(d) for d in deduped_decisions], columns=RESULT_COLUMNS)
+    result_df = pd.DataFrame([decision_to_result_row(d) for d in decisions], columns=RESULT_COLUMNS)
     analysis_df = pd.DataFrame([decision_to_analysis_row(d) for d in deduped_decisions], columns=ANALYSIS_COLUMNS)
     analysis_summary_df = pd.DataFrame(build_analysis_summary_rows(decisions, wfy_map), columns=ANALYSIS_SUMMARY_COLUMNS)
 
