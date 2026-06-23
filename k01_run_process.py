@@ -188,6 +188,7 @@ SC_FAILED_IOCS: list[str] = []
 WD_FAILED_IOCS: list[str] = []
 AI_FAILED_IOCS: list[str] = []
 LLM_FAILED_IOCS: list[str] = []
+WD_SNAPSHOT_TOPIC_SUMMARY_CACHE: dict[str, str] = {}
 THREAD_LOCAL = local()
 
 
@@ -236,6 +237,8 @@ class WdInfo:
     malicious: bool = False
     has_snapshot: bool = False
     snapshot_topic: str = ""
+    snapshot_title: str = ""
+    snapshot_content: str = ""
     query_error: str = ""
 
 
@@ -1284,7 +1287,25 @@ def wd_snapshot_row_title(row: dict[str, Any]) -> str:
     )
 
 
-def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, str]:
+def wd_snapshot_row_content(row: dict[str, Any]) -> str:
+    content = first_not_empty(
+        row.get("content"),
+        row.get("text"),
+        row.get("summary"),
+        row.get("html"),
+        row.get("snapshot"),
+    )
+    text = normalize_cell(content)
+    if not text:
+        return ""
+    text = re.sub(r"(?is)<script.*?</script>", " ", text)
+    text = re.sub(r"(?is)<style.*?</style>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:4000]
+
+
+def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, str, str, str]:
     headers = {"X-Authtoken": WD_HISTORY_TOKEN}
     params = {"query": ioc, "time_start": WD_HISTORY_START}
     try:
@@ -1298,7 +1319,7 @@ def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, st
         data = safe_json_response(resp)
         rows = data.get("data") if isinstance(data, dict) else []
         if not isinstance(rows, list):
-            return False, "", "wd history data is not list"
+            return False, "", "", "", "wd history data is not list"
         snapshot_rows: list[dict[str, Any]] = []
         for row in rows:
             if not isinstance(row, dict):
@@ -1306,20 +1327,19 @@ def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, st
             if wd_snapshot_row_has_content(row):
                 snapshot_rows.append(row)
         if not snapshot_rows:
-            return False, "", ""
-        topic = first_not_empty(
-            *(wd_snapshot_row_title(row) for row in snapshot_rows),
-            *(row.get("url") for row in snapshot_rows),
-        )
-        return True, topic, ""
+            return False, "", "", "", ""
+        title = first_not_empty(*(wd_snapshot_row_title(row) for row in snapshot_rows))
+        content = first_not_empty(*(wd_snapshot_row_content(row) for row in snapshot_rows))
+        topic = title
+        return True, topic, title, content, ""
     except Exception as exc:
-        return False, "", str(exc)
+        return False, "", "", "", str(exc)
 
 
-def query_wd_history_one(ioc: str) -> tuple[str, bool, str, str]:
+def query_wd_history_one(ioc: str) -> tuple[str, bool, str, str, str, str]:
     session = get_thread_session()
-    has_snapshot, topic, error = query_wd_history_snapshot(session, ioc)
-    return ioc, has_snapshot, topic, error
+    has_snapshot, topic, title, content, error = query_wd_history_snapshot(session, ioc)
+    return ioc, has_snapshot, topic, title, content, error
 
 
 def query_wd(session: Session, ioc_list: list[str]) -> dict[str, WdInfo]:
@@ -1373,10 +1393,12 @@ def query_wd(session: Session, ioc_list: list[str]) -> dict[str, WdInfo]:
     print(f"[+] wd urldb 快照待查询：{len(malicious_iocs)} 条，并发数 {min(WD_WORKERS, len(malicious_iocs))}")
     if WD_WORKERS <= 1 or len(malicious_iocs) == 1:
         for index, ioc in enumerate(malicious_iocs, 1):
-            _, has_snapshot, topic, snapshot_error = query_wd_history_one(ioc)
+            _, has_snapshot, topic, title, content, snapshot_error = query_wd_history_one(ioc)
             info = result_map.get(ioc, WdInfo(ioc=ioc))
             info.has_snapshot = has_snapshot
             info.snapshot_topic = topic
+            info.snapshot_title = title
+            info.snapshot_content = content
             if snapshot_error:
                 info.query_error = "; ".join(x for x in (info.query_error, snapshot_error) if x)
                 WD_FAILED_IOCS.append(f"{ioc} | {snapshot_error}")
@@ -1393,12 +1415,14 @@ def query_wd(session: Session, ioc_list: list[str]) -> dict[str, WdInfo]:
             ioc = future_map[future]
             completed += 1
             try:
-                _, has_snapshot, topic, snapshot_error = future.result()
+                _, has_snapshot, topic, title, content, snapshot_error = future.result()
             except Exception as exc:
-                has_snapshot, topic, snapshot_error = False, "", str(exc)
+                has_snapshot, topic, title, content, snapshot_error = False, "", "", "", str(exc)
             info = result_map.get(ioc, WdInfo(ioc=ioc))
             info.has_snapshot = has_snapshot
             info.snapshot_topic = topic
+            info.snapshot_title = title
+            info.snapshot_content = content
             if snapshot_error:
                 info.query_error = "; ".join(x for x in (info.query_error, snapshot_error) if x)
                 WD_FAILED_IOCS.append(f"{ioc} | {snapshot_error}")
@@ -1608,8 +1632,8 @@ def classify_owner(xmon_info: XmonInfo, wfy_info: dict[str, Any], wd_info: WdInf
     return pick_owner_candidate(candidates)
 
 
-def has_wd_malicious_snapshot(wd_info: WdInfo) -> tuple[bool, str]:
-    return wd_info.malicious and wd_info.has_snapshot, wd_info.snapshot_topic
+def has_wd_malicious_snapshot(wd_info: WdInfo) -> bool:
+    return wd_info.malicious and wd_info.has_snapshot
 
 
 def extract_xmon_description(xmon_info: XmonInfo) -> str:
@@ -1632,9 +1656,25 @@ def extract_xmon_description(xmon_info: XmonInfo) -> str:
     return ""
 
 
+def wd_snapshot_rule_description(description: str) -> str:
+    text = normalize_cell(description)
+    if text.startswith("钓鱼欺诈"):
+        return "钓鱼欺诈"
+    return ""
+
+
+def resolve_wd_snapshot_topic(ioc: str, wd_info: WdInfo) -> str:
+    title = normalize_cell(wd_info.snapshot_title)
+    if title:
+        return title
+    topic, error = query_wd_snapshot_llm_topic(ioc, wd_info.snapshot_content)
+    if error:
+        LLM_FAILED_IOCS.append(f"{ioc} | wd 快照主题大模型总结失败：{error}")
+    return topic
+
+
 def format_wd_snapshot_info_add(description: str, topic: str) -> str:
-    description_json = json.dumps({"description": normalize_cell(description)}, ensure_ascii=False)
-    return f"内容类存在恶意快照的ioc,{description_json}（{topic}）"
+    return f"内容类存在恶意快照的ioc,描述信息：{description}，主题内容：{topic}"
 
 
 def summarize_evidence_details(details: list[str], limit: int = 50) -> str:
@@ -1686,7 +1726,7 @@ def normalize_siyubo_llm_summary(summary: str) -> str:
     text = text.strip("\"'“”‘’")
     if any(term in text for term in SIYUBO_NO_RESULT_TERMS):
         return ""
-    return text[:50]
+    return text
 
 
 def normalize_ai_llm_summary(summary: str) -> str:
@@ -1698,7 +1738,7 @@ def normalize_ai_llm_summary(summary: str) -> str:
     text = text.strip("\"'“”‘’")
     if any(term in text for term in AI_NO_RESULT_TERMS):
         return ""
-    return text[:50]
+    return text
 
 
 def parse_llm_summary_response(data: Any) -> str:
@@ -1752,6 +1792,44 @@ def query_llm_chat_summary(payload: dict[str, Any]) -> tuple[str, str]:
         except Exception as exc:
             last_error = str(exc)
     return "", last_error
+
+
+def normalize_wd_snapshot_llm_topic(topic: str) -> str:
+    text = normalize_cell(topic)
+    if not text:
+        return ""
+    text = re.sub(r"^```(?:text)?", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    return text.strip("\"'“”‘’")
+
+
+def query_wd_snapshot_llm_topic(ioc: str, content: str) -> tuple[str, str]:
+    text = normalize_cell(content)
+    if not text:
+        return "", ""
+    if ioc in WD_SNAPSHOT_TOPIC_SUMMARY_CACHE:
+        return WD_SNAPSHOT_TOPIC_SUMMARY_CACHE[ioc], ""
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": "你是安全情报分析助手，只输出最终主题内容，不要解释。"},
+            {
+                "role": "user",
+                "content": (
+                    "以下是恶意快照页面内容。请总结快照主题内容，50字以内。"
+                    "不要输出前缀、编号或解释。\n\n"
+                    f"快照内容如下：\n{text[:4000]}"
+                ),
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 120,
+    }
+    topic, error = query_llm_chat_summary(payload)
+    normalized_topic = normalize_wd_snapshot_llm_topic(topic)
+    if normalized_topic:
+        WD_SNAPSHOT_TOPIC_SUMMARY_CACHE[ioc] = normalized_topic
+    return normalized_topic, error
 
 
 def query_siyubo_llm_summary_one(ioc: str, details: list[str]) -> tuple[str, str, str]:
@@ -2024,7 +2102,7 @@ def decide_row(
             first_hash_info = hash_info
 
     first_report = pick_first_report(xmon_info.report_links)
-    wd_snapshot, wd_topic = has_wd_malicious_snapshot(wd_info)
+    wd_snapshot = has_wd_malicious_snapshot(wd_info)
     decision.owner = classify_owner(xmon_info, wfy_info, wd_info, sc_malicious)
 
     if not wfy_is_black(wfy_info):
@@ -2067,15 +2145,17 @@ def decide_row(
         return decision
 
     if decision.owner == "wd" and wd_snapshot:
-        topic = wd_topic or decision.result_ioc
         description = extract_xmon_description(xmon_info)
-        decision.k01_result = "有效"
-        decision.info_add = format_wd_snapshot_info_add(description, topic)
-        decision.solvable = "能"
-        decision.solution = "src是wd且有快照"
-        decision.rule_hit = "wd_snapshot"
-        decision.hit_rule = "src是wd且有快照"
-        return decision
+        rule_description = wd_snapshot_rule_description(description)
+        if rule_description:
+            topic = resolve_wd_snapshot_topic(decision.ioc, wd_info)
+            decision.k01_result = "有效"
+            decision.info_add = format_wd_snapshot_info_add(rule_description, topic)
+            decision.solvable = "能"
+            decision.solution = "src是wd且有快照"
+            decision.rule_hit = "wd_snapshot"
+            decision.hit_rule = "src是wd且有快照"
+            return decision
 
     if decision.owner == "siyubo":
         evidence_summary = normalize_cell(siyubo_evidence_summary)
@@ -2143,7 +2223,7 @@ def print_debug_ioc(
 
 def decision_to_result_row(decision: RowDecision) -> dict[str, str]:
     return {
-        "IOC": decision.ioc,
+        "IOC": decision.result_ioc,
         "端口": decision.port,
         "厂商": decision.vendor,
         "外联日期": decision.out_date,
@@ -2409,9 +2489,6 @@ def main() -> None:
             continue
         if pick_first_report(xmon_info.report_links):
             continue
-        wd_snapshot, _ = has_wd_malicious_snapshot(wd_info)
-        if wd_snapshot:
-            continue
         details = extract_siyubo_evidence_details(xmon_info)
         if details:
             siyubo_evidence_details_map[ioc] = details
@@ -2431,9 +2508,6 @@ def main() -> None:
         if has_black_hash_evidence(xmon_info, hash_map):
             continue
         if pick_first_report(xmon_info.report_links):
-            continue
-        wd_snapshot, _ = has_wd_malicious_snapshot(wd_info)
-        if wd_snapshot:
             continue
         if siyubo_summary_map.get(ioc):
             continue
