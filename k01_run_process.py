@@ -32,8 +32,9 @@ from requests.adapters import HTTPAdapter
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR = os.path.join(BASE_DIR, "input")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-RESULT_FILE = os.getenv("K01_RESULT_FILE", os.path.join(OUTPUT_DIR, "result.xlsx"))
-ANALYSIS_FILE = os.getenv("K01_ANALYSIS_FILE", os.path.join(OUTPUT_DIR, "数据分析.xlsx"))
+OUTPUT_DATE = time.strftime("%Y-%m-%d")
+RESULT_FILE = os.getenv("K01_RESULT_FILE", os.path.join(OUTPUT_DIR, f"k01_result_{OUTPUT_DATE}.xlsx"))
+ANALYSIS_FILE = os.getenv("K01_ANALYSIS_FILE", os.path.join(OUTPUT_DIR, f"k01_analysis_{OUTPUT_DATE}.xlsx"))
 
 VENDOR = "360"
 
@@ -1466,7 +1467,8 @@ def map_k01_status(xmon_status: Any) -> str:
     status = normalize_cell(xmon_status).upper()
     status_map = {
         "ACTIVE": "存活",
-        "UNKNOWN": "失活",
+        "UNKNOWN": "存活",
+        "OVER": "失活",
         "SINKHOLE": "被安全机构接管",
     }
     return status_map.get(status, status)
