@@ -174,6 +174,7 @@ RESULT_COLUMNS = [
     "补充信息",
     "误报原因",
     "命中规则",
+    "拼接后的ioc",
 ]
 
 ANALYSIS_COLUMNS = ["ioc外联目标", "端口", "厂商", "ioc", "生产方归属", "能否解决", "相关解决方案"]
@@ -2289,6 +2290,7 @@ def decision_to_result_row(decision: RowDecision) -> dict[str, str]:
         "补充信息": decision.info_add,
         "误报原因": "",
         "命中规则": decision.hit_rule,
+        "拼接后的ioc": decision.ioc,
     }
 
 
