@@ -2365,10 +2365,9 @@ def list_input_files() -> list[str]:
 
 
 def read_input_file(path: str) -> pd.DataFrame:
-    try:
-        df = pd.read_excel(path, sheet_name="受控外联情报研判_1", dtype=str).fillna("")
-    except ValueError as exc:
-        raise ValueError(f"读取输入文件失败：{path}，请确认存在 sheet：受控外联情报研判_1") from exc
+    workbook = pd.ExcelFile(path)
+    sheet_name = "受控外联情报研判_1" if "受控外联情报研判_1" in workbook.sheet_names else workbook.sheet_names[0]
+    df = pd.read_excel(workbook, sheet_name=sheet_name, dtype=str).fillna("")
     required = ["外联目标", "端口", "目标类型", "外联日期"]
     missing = [col for col in required if col not in df.columns]
     if missing:
