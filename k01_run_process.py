@@ -2077,35 +2077,60 @@ def query_ai_quick_analysis(ioc_list: list[str]) -> dict[str, AiInfo]:
     result_map: dict[str, AiInfo] = {}
     if not unique_iocs:
         return result_map
-    print(f"[+] 智能体证据链待查询：{len(unique_iocs)} 条，并发数 {min(AI_WORKERS, len(unique_iocs))}")
-    if AI_WORKERS <= 1 or len(unique_iocs) == 1:
-        for index, ioc in enumerate(unique_iocs, 1):
-            info = query_ai_quick_analysis_one(ioc)
-            if info.query_error:
-                AI_FAILED_IOCS.append(f"{ioc} | {info.query_error}")
-            result_map[ioc] = info
-            if index % AI_PROGRESS_INTERVAL == 0 or index == len(unique_iocs):
-                print(f"[+] 智能体证据链查询进度：{index}/{len(unique_iocs)}")
-            time.sleep(SLEEP_SECONDS)
-        return enrich_ai_infos_with_llm_summaries(result_map)
+    ai_worker_count = min(max(AI_WORKERS, 1), len(unique_iocs))
+    llm_worker_count = min(max(LLM_WORKERS, 1), len(unique_iocs))
+    print(f"[+] 智能体证据链待查询：{len(unique_iocs)} 条，并发数 {ai_worker_count}")
+    if not LLM_TOKEN:
+        print("[!] 未配置 LLM_TOKEN，跳过智能体证据链大模型总结。")
 
-    worker_count = min(AI_WORKERS, len(unique_iocs))
     completed = 0
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {executor.submit(query_ai_quick_analysis_one, ioc): ioc for ioc in unique_iocs}
-        for future in as_completed(future_map):
-            ioc = future_map[future]
-            completed += 1
-            try:
-                info = future.result()
-            except Exception as exc:
-                info = AiInfo(ioc=ioc, query_error=str(exc))
-            if info.query_error:
-                AI_FAILED_IOCS.append(f"{ioc} | {info.query_error}")
-            result_map[ioc] = info
-            if completed % AI_PROGRESS_INTERVAL == 0 or completed == len(unique_iocs):
-                print(f"[+] 智能体证据链查询进度：{completed}/{len(unique_iocs)}")
-    return enrich_ai_infos_with_llm_summaries(result_map)
+    llm_future_map: dict[Any, str] = {}
+
+    def collect_ai_results(llm_executor: ThreadPoolExecutor | None = None) -> None:
+        nonlocal completed
+        with ThreadPoolExecutor(max_workers=ai_worker_count) as ai_executor:
+            future_map = {ai_executor.submit(query_ai_quick_analysis_one, ioc): ioc for ioc in unique_iocs}
+            for future in as_completed(future_map):
+                ioc = future_map[future]
+                completed += 1
+                try:
+                    info = future.result()
+                except Exception as exc:
+                    info = AiInfo(ioc=ioc, query_error=str(exc))
+                if info.query_error:
+                    AI_FAILED_IOCS.append(f"{ioc} | {info.query_error}")
+                result_map[ioc] = info
+                if llm_executor and info.key_evidence:
+                    llm_future = llm_executor.submit(query_ai_evidence_llm_summary_one, ioc, info.key_evidence)
+                    llm_future_map[llm_future] = ioc
+                if completed % AI_PROGRESS_INTERVAL == 0 or completed == len(unique_iocs):
+                    print(f"[+] 智能体证据链查询进度：{completed}/{len(unique_iocs)}")
+
+    if LLM_TOKEN:
+        print(f"[+] 智能体证据链大模型总结采用流水线，并发数 {llm_worker_count}")
+        with ThreadPoolExecutor(max_workers=llm_worker_count) as llm_executor:
+            collect_ai_results(llm_executor)
+            llm_total = len(llm_future_map)
+            if llm_total:
+                print(f"[+] 智能体证据链大模型总结待处理：{llm_total} 条")
+            llm_completed = 0
+            for future in as_completed(llm_future_map):
+                ioc = llm_future_map[future]
+                llm_completed += 1
+                try:
+                    _, summary, error = future.result()
+                except Exception as exc:
+                    summary = ""
+                    error = str(exc)
+                if error:
+                    AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
+                if summary:
+                    result_map[ioc].summary = summary
+                if llm_total and (llm_completed % AI_PROGRESS_INTERVAL == 0 or llm_completed == llm_total):
+                    print(f"[+] 智能体证据链大模型总结进度：{llm_completed}/{llm_total}")
+    else:
+        collect_ai_results()
+    return result_map
 
 
 def has_black_hash_evidence(xmon_info: XmonInfo, hash_map: dict[str, HashInfo]) -> bool:
@@ -2333,6 +2358,13 @@ def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str,
         f"{owner}（{owner_counter.get(owner, 0)}条）"
         for owner in ("atateam", "siyubo", "wd", "netlab", "unknown")
     )
+    non_ai_decisions = [decision for decision in deduped_decisions if decision.hit_rule != "智能体证据链"]
+    non_ai_owner_counter = Counter(decision.owner if decision.owner in OWNER_PRIORITY else "unknown" for decision in non_ai_decisions)
+    non_ai_owner_total = sum(non_ai_owner_counter.get(owner, 0) for owner in OWNER_PRIORITY)
+    non_ai_owner_text = "，".join(
+        f"{owner}（{non_ai_owner_counter.get(owner, 0)}/{owner_counter.get(owner, 0)}条）"
+        for owner in ("atateam", "siyubo", "wd", "netlab", "unknown")
+    )
 
     lines = [
         f"今日告警数量：{today_alert_count}",
@@ -2344,6 +2376,7 @@ def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str,
         f"智能体证据链{ai_evidence_count}",
         f"还剩余{remaining_count}条ioc",
         f"拼接ioc去重后生产方归属总计{owner_total}条，{owner_text}",
+        f"拼接ioc去重后，排除智能体证据链后，生产方归属总计{non_ai_owner_total}/{owner_total}条，{non_ai_owner_text}",
     ]
     return [{"序号": str(index), "统计信息": line} for index, line in enumerate(lines, 1)]
 
