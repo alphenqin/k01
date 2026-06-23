@@ -774,8 +774,11 @@ def query_xmon_iocs(session: Session, ioc_list: list[str]) -> dict[str, XmonInfo
 
     resolvable, resolve_error = can_resolve_host(XMON_BASE_URL)
     if not resolvable:
-        print(f"[!] xmon 域名无法解析，跳过 xmon 查询：{urlparse(XMON_BASE_URL).hostname}，错误：{resolve_error}")
+        host = urlparse(XMON_BASE_URL).hostname
+        error = f"xmon 域名无法解析，跳过 xmon 查询：{host}，错误：{resolve_error}"
+        print(f"[!] {error}")
         print("[!] 请确认当前环境能访问内网 DNS/VPN，或在 WSL/Linux 中配置可解析 xmon.netlab.qihoo.net 的 DNS/hosts。")
+        XMON_FAILED_IOCS.extend(f"{ioc} | {error}" for ioc in query_iocs)
         return {ioc: result_map.get(ioc, empty_xmon_info(ioc)) for ioc in ioc_list}
 
     main_batches = chunk_xmon_iocs_by_url(query_iocs, build_xmon_batch_url)
@@ -2177,13 +2180,14 @@ def decide_row(
             decision.rule_hit = "siyubo_evidence_chain"
             decision.hit_rule = "siyubo证据链"
             return finalize_decision(decision)
-        if ai_info and ai_info.summary:
-            decision.k01_result = "有效"
-            decision.info_add = ai_info.summary
-            decision.solvable = "能"
-            decision.solution = "智能体证据链"
-            decision.rule_hit = "ai_evidence_chain"
-            decision.hit_rule = "智能体证据链"
+
+    if ai_info and ai_info.summary:
+        decision.k01_result = "有效"
+        decision.info_add = ai_info.summary
+        decision.solvable = "能"
+        decision.solution = "智能体证据链"
+        decision.rule_hit = "ai_evidence_chain"
+        decision.hit_rule = "智能体证据链"
         return finalize_decision(decision)
 
     if white_hash_seen:
@@ -2511,9 +2515,7 @@ def main() -> None:
     for ioc in ioc_list:
         xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
         wfy_info = wfy_map.get(ioc, {})
-        wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
-        owner = classify_owner(xmon_info, wfy_info, wd_info, sc_map.get(ioc, False))
-        if owner != "siyubo":
+        if not wfy_is_black(wfy_info):
             continue
         if has_black_hash_evidence(xmon_info, hash_map):
             continue
