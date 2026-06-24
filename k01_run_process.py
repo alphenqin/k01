@@ -199,6 +199,7 @@ WFY_FAILED_QUERIES: list[str] = []
 SC_FAILED_IOCS: list[str] = []
 WD_FAILED_IOCS: list[str] = []
 AI_FAILED_IOCS: list[str] = []
+SIYUBO_LLM_REJECTED_SUMMARIES: list[str] = []
 AI_LLM_REJECTED_SUMMARIES: list[str] = []
 LLM_FAILED_IOCS: list[str] = []
 WD_SNAPSHOT_TOPIC_SUMMARY_CACHE: dict[str, str] = {}
@@ -1789,15 +1790,20 @@ def extract_siyubo_evidence_details(xmon_info: XmonInfo) -> list[str]:
     return list(dict.fromkeys(details))
 
 
-def normalize_siyubo_llm_summary(summary: str) -> str:
+def normalize_siyubo_llm_summary_with_reason(summary: str) -> tuple[str, str]:
     text = normalize_cell(summary)
     if not text:
-        return ""
+        return "", "大模型返回空"
     text = re.sub(r"^```(?:text)?", "", text).strip()
     text = re.sub(r"```$", "", text).strip()
     text = text.strip("\"'“”‘’")
     if any(term in text for term in SIYUBO_NO_RESULT_TERMS):
-        return ""
+        return "", "大模型判定无法形成恶意依据"
+    return text, ""
+
+
+def normalize_siyubo_llm_summary(summary: str) -> str:
+    text, _ = normalize_siyubo_llm_summary_with_reason(summary)
     return text
 
 
@@ -1937,7 +1943,12 @@ def query_siyubo_llm_summary_one(ioc: str, details: list[str]) -> tuple[str, str
         "max_tokens": LLM_SUMMARY_MAX_TOKENS,
     }
     summary, error = query_llm_chat_summary(payload)
-    return ioc, normalize_siyubo_llm_summary(summary), error
+    normalized_summary, reject_reason = normalize_siyubo_llm_summary_with_reason(summary)
+    if reject_reason and not error:
+        raw_summary = normalize_cell(summary)
+        evidence_text = "；".join(cleaned_details)
+        return ioc, "", f"SUMMARY_REJECTED:{reject_reason}：{raw_summary} | siyubo证据链：{evidence_text}"
+    return ioc, normalized_summary, error
 
 
 def query_siyubo_llm_summaries(evidence_map: dict[str, list[str]]) -> dict[str, str]:
@@ -1954,7 +1965,10 @@ def query_siyubo_llm_summaries(evidence_map: dict[str, list[str]]) -> dict[str, 
         for index, (ioc, details) in enumerate(candidates.items(), 1):
             _, summary, error = query_siyubo_llm_summary_one(ioc, details)
             if error:
-                LLM_FAILED_IOCS.append(f"{ioc} | {error}")
+                if error.startswith("SUMMARY_REJECTED:"):
+                    SIYUBO_LLM_REJECTED_SUMMARIES.append(f"{ioc} | {error.removeprefix('SUMMARY_REJECTED:')}")
+                else:
+                    LLM_FAILED_IOCS.append(f"{ioc} | {error}")
             if summary:
                 result_map[ioc] = summary
             if index % AI_PROGRESS_INTERVAL == 0 or index == len(candidates):
@@ -1978,7 +1992,10 @@ def query_siyubo_llm_summaries(evidence_map: dict[str, list[str]]) -> dict[str, 
                 summary = ""
                 error = str(exc)
             if error:
-                LLM_FAILED_IOCS.append(f"{ioc} | {error}")
+                if error.startswith("SUMMARY_REJECTED:"):
+                    SIYUBO_LLM_REJECTED_SUMMARIES.append(f"{ioc} | {error.removeprefix('SUMMARY_REJECTED:')}")
+                else:
+                    LLM_FAILED_IOCS.append(f"{ioc} | {error}")
             if summary:
                 result_map[ioc] = summary
             if completed % AI_PROGRESS_INTERVAL == 0 or completed == len(candidates):
@@ -2531,6 +2548,7 @@ def print_query_failures() -> None:
     print_failure_summary("sc 查询失败 IOC", SC_FAILED_IOCS)
     print_failure_summary("wd 查询异常 IOC", WD_FAILED_IOCS)
     print_failure_summary("siyubo evidence_chain 大模型总结异常 IOC", LLM_FAILED_IOCS)
+    print_failure_summary("siyubo evidence_chain 大模型总结无效 IOC", SIYUBO_LLM_REJECTED_SUMMARIES, max_items=50)
     print_failure_summary("智能体证据链查询异常 IOC", AI_FAILED_IOCS, max_items=None)
     print_failure_summary("智能体证据链大模型总结不合规 IOC", AI_LLM_REJECTED_SUMMARIES, max_items=50)
 
