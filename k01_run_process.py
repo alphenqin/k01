@@ -96,14 +96,14 @@ AI_KEY_EVIDENCE_DROP_TERMS = ("外部威胁情报", "威胁情报状态", "外�
 
 # ===== 大模型公共配置 =====
 LLM_API_URL = os.getenv("K01_LLM_API_URL", "https://api.360.cn/v1/chat/completions")
-LLM_MODEL = os.getenv("K01_LLM_MODEL", "deepseek/deepseek-v4-flash-internal")
+LLM_MODEL = os.getenv("K01_LLM_MODEL", "bytedance/doubao-seed-1-6-flash")
 LLM_TOKEN = os.getenv("K01_LLM_TOKEN", "fk3631605771.SW4G9234O44_fCdZNjrfq4KjcJFrmini5f2f056c")  # 如需使用大模型能力，在这里或环境变量填写 token。
 
 # ===== siyubo evidence_chain 总结配置 =====
 SIYUBO_NO_RESULT = "信息有限，无对应研判结果"
 SIYUBO_NO_RESULT_TERMS = ("无法研判", "无法判断", "不能研判", "信息有限", "无对应研判结果")
 SIYUBO_EVIDENCE_PROMPT = (
-    "将evidence_chain中的detail汇总为50字以内的情报研判依据。"
+    "将evidence_chain中的detail汇总为50字左右的情报研判依据。"
     f"若出现无法研判相关词汇则总结为：{SIYUBO_NO_RESULT}。"
 )
 AI_NO_RESULT_TERMS = ("无法研判", "无法判断", "不能研判", "信息有限", "无对应研判结果", "信息不足", "空字符串")
@@ -141,12 +141,12 @@ WD_WORKERS = 12  # wd 查询并发数；safe 评分按批次并发，恶意 IOC 
 WD_SAFE_BATCH_SIZE = 20  # wd safe 评分接口每批 IOC 数。
 WD_SAFE_MAX_BATCH_SIZE = 20  # wd safe 评分接口允许的最大批量；第 21 条起会被接口静默截断。
 WD_PROGRESS_INTERVAL = 100  # wd 每处理多少条 IOC 打印一次进度。
-AI_WORKERS = 32  # 智能体证据链接口并发数；接口不支持批量，过高容易 500/502/超时。
+AI_WORKERS = 24  # 智能体证据链接口并发数；接口不支持批量，过高容易 500/502/超时。
 AI_PROGRESS_INTERVAL = 100  # 智能体证据链每处理多少条 IOC 打印一次进度。
 AI_RETRIES = 3  # 智能体证据链接口失败后的重试次数。
 AI_RETRY_SLEEP_SECONDS = 5.0  # 智能体证据链重试退避基准秒数；实际等待按 5、10、15... 递增。
 LLM_WORKERS = 24  # 大模型接口并发数；外部模型接口不宜过高。
-LLM_RETRIES = 2  # 大模型接口失败后的重试次数。
+LLM_RETRIES = 3  # 大模型接口失败后的重试次数。
 LLM_RETRY_SLEEP_SECONDS = 2.0  # 大模型接口重试等待秒数。
 SLEEP_SECONDS = 0.05  # 串行分支中每次请求后的短暂停顿，降低接口压力。
 LIMIT = 0  # 调试用输入行数限制；0 表示不限制，处理全部输入。
@@ -194,6 +194,7 @@ WFY_FAILED_QUERIES: list[str] = []
 SC_FAILED_IOCS: list[str] = []
 WD_FAILED_IOCS: list[str] = []
 AI_FAILED_IOCS: list[str] = []
+AI_LLM_REJECTED_SUMMARIES: list[str] = []
 LLM_FAILED_IOCS: list[str] = []
 WD_SNAPSHOT_TOPIC_SUMMARY_CACHE: dict[str, str] = {}
 THREAD_LOCAL = local()
@@ -1774,19 +1775,24 @@ def normalize_siyubo_llm_summary(summary: str) -> str:
     return text
 
 
-def normalize_ai_llm_summary(summary: str) -> str:
+def normalize_ai_llm_summary_with_reason(summary: str) -> tuple[str, str]:
     text = normalize_cell(summary)
     if not text:
-        return ""
+        return "", "大模型返回空"
     text = re.sub(r"^```(?:text)?", "", text).strip()
     text = re.sub(r"```$", "", text).strip()
     text = text.strip("\"'“”‘’")
     if any(term in text for term in AI_NO_RESULT_TERMS):
-        return ""
+        return "", "包含无法形成依据相关词"
     if text in AI_GENERIC_SUMMARIES or len(text) < AI_SUMMARY_MIN_CHARS:
-        return ""
+        return "", "泛化短语或长度过短"
     if not text.endswith(AI_COMPLETE_SUMMARY_ENDINGS):
-        return ""
+        return "", "未以完整句结束"
+    return text, ""
+
+
+def normalize_ai_llm_summary(summary: str) -> str:
+    text, _ = normalize_ai_llm_summary_with_reason(summary)
     return text
 
 
@@ -1872,7 +1878,7 @@ def query_wd_snapshot_llm_topic(ioc: str, content: str) -> tuple[str, str]:
             },
         ],
         "temperature": 0,
-        "max_tokens": 120,
+        "max_tokens": 500,
     }
     topic, error = query_llm_chat_summary(payload)
     normalized_topic = normalize_wd_snapshot_llm_topic(topic)
@@ -1902,7 +1908,7 @@ def query_siyubo_llm_summary_one(ioc: str, details: list[str]) -> tuple[str, str
             },
         ],
         "temperature": 0,
-        "max_tokens": 120,
+        "max_tokens": 500,
     }
     summary, error = query_llm_chat_summary(payload)
     return ioc, normalize_siyubo_llm_summary(summary), error
@@ -2026,7 +2032,11 @@ def query_ai_evidence_llm_summary_one(ioc: str, details: list[str]) -> tuple[str
         "max_tokens": 120,
     }
     summary, error = query_llm_chat_summary(payload)
-    return ioc, normalize_ai_llm_summary(summary), error
+    normalized_summary, reject_reason = normalize_ai_llm_summary_with_reason(summary)
+    if reject_reason and not error:
+        raw_summary = normalize_cell(summary)
+        return ioc, "", f"SUMMARY_REJECTED:{reject_reason}：{raw_summary}"
+    return ioc, normalized_summary, error
 
 
 def enrich_ai_infos_with_llm_summaries(result_map: dict[str, AiInfo]) -> dict[str, AiInfo]:
@@ -2042,7 +2052,10 @@ def enrich_ai_infos_with_llm_summaries(result_map: dict[str, AiInfo]) -> dict[st
         for index, (ioc, details) in enumerate(candidates.items(), 1):
             _, summary, error = query_ai_evidence_llm_summary_one(ioc, details)
             if error:
-                AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
+                if error.startswith("SUMMARY_REJECTED:"):
+                    AI_LLM_REJECTED_SUMMARIES.append(f"{ioc} | {error.removeprefix('SUMMARY_REJECTED:')}")
+                else:
+                    AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
             if summary:
                 result_map[ioc].summary = summary
             if index % AI_PROGRESS_INTERVAL == 0 or index == len(candidates):
@@ -2066,7 +2079,10 @@ def enrich_ai_infos_with_llm_summaries(result_map: dict[str, AiInfo]) -> dict[st
                 summary = ""
                 error = str(exc)
             if error:
-                AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
+                if error.startswith("SUMMARY_REJECTED:"):
+                    AI_LLM_REJECTED_SUMMARIES.append(f"{ioc} | {error.removeprefix('SUMMARY_REJECTED:')}")
+                else:
+                    AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
             if summary:
                 result_map[ioc].summary = summary
             if completed % AI_PROGRESS_INTERVAL == 0 or completed == len(candidates):
@@ -2107,7 +2123,10 @@ def query_ai_quick_analysis(ioc_list: list[str]) -> dict[str, AiInfo]:
             summary = ""
             error = str(exc)
         if error:
-            AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
+            if error.startswith("SUMMARY_REJECTED:"):
+                AI_LLM_REJECTED_SUMMARIES.append(f"{ioc} | {error.removeprefix('SUMMARY_REJECTED:')}")
+            else:
+                AI_FAILED_IOCS.append(f"{ioc} | 智能体证据链大模型总结失败：{error}")
         if summary:
             result_map[ioc].summary = summary
 
@@ -2480,6 +2499,7 @@ def print_query_failures() -> None:
     print_failure_summary("wd 查询异常 IOC", WD_FAILED_IOCS)
     print_failure_summary("siyubo evidence_chain 大模型总结异常 IOC", LLM_FAILED_IOCS)
     print_failure_summary("智能体证据链查询异常 IOC", AI_FAILED_IOCS, max_items=None)
+    print_failure_summary("智能体证据链大模型总结不合规 IOC", AI_LLM_REJECTED_SUMMARIES, max_items=50)
 
 
 def remove_old_outputs() -> None:
