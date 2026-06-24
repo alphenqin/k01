@@ -96,8 +96,10 @@ AI_KEY_EVIDENCE_DROP_TERMS = ("外部威胁情报", "威胁情报状态", "外�
 
 # ===== 大模型公共配置 =====
 LLM_API_URL = os.getenv("K01_LLM_API_URL", "https://api.360.cn/v1/chat/completions")
-LLM_MODEL = os.getenv("K01_LLM_MODEL", "bytedance/doubao-seed-1-6-flash")
+LLM_MODEL = os.getenv("K01_LLM_MODEL", "deepseek/deepseek-v4-flash-internal")
 LLM_TOKEN = os.getenv("K01_LLM_TOKEN", "fk3631605771.SW4G9234O44_fCdZNjrfq4KjcJFrmini5f2f056c")  # 如需使用大模型能力，在这里或环境变量填写 token。
+LLM_SUMMARY_MAX_TOKENS = 2048  # 该接口会按 max_tokens 裁剪 messages，摘要场景不要设得过低。
+LLM_EVIDENCE_MAX_INPUT_CHARS = 3000  # 主动限制证据输入长度，避免服务端不可控截断。
 
 # ===== siyubo evidence_chain 总结配置 =====
 SIYUBO_NO_RESULT = "信息有限，无对应研判结果"
@@ -1738,6 +1740,23 @@ def summarize_evidence_details(details: list[str], limit: int = 50) -> str:
     return summary[:limit]
 
 
+def format_llm_evidence_bullets(details: list[str], max_chars: int = LLM_EVIDENCE_MAX_INPUT_CHARS) -> str:
+    lines: list[str] = []
+    used = 0
+    for detail in dict.fromkeys(normalize_cell(item) for item in details):
+        if not detail:
+            continue
+        line = f"- {detail}"
+        next_used = used + len(line) + (1 if lines else 0)
+        if lines and next_used > max_chars:
+            break
+        if not lines and len(line) > max_chars:
+            line = line[:max_chars]
+        lines.append(line)
+        used += len(line) + (1 if lines else 0)
+    return "\n".join(lines)
+
+
 def extract_siyubo_evidence_details(xmon_info: XmonInfo) -> list[str]:
     raw = xmon_info.raw if isinstance(xmon_info.raw, dict) else {}
     clues = raw.get("__valid_clues")
@@ -1878,7 +1897,7 @@ def query_wd_snapshot_llm_topic(ioc: str, content: str) -> tuple[str, str]:
             },
         ],
         "temperature": 0,
-        "max_tokens": 500,
+        "max_tokens": LLM_SUMMARY_MAX_TOKENS,
     }
     topic, error = query_llm_chat_summary(payload)
     normalized_topic = normalize_wd_snapshot_llm_topic(topic)
@@ -1903,12 +1922,12 @@ def query_siyubo_llm_summary_one(ioc: str, details: list[str]) -> tuple[str, str
                 "content": (
                     f"{SIYUBO_EVIDENCE_PROMPT}\n\n"
                     "evidence_chain detail如下：\n"
-                    + "\n".join(f"- {detail}" for detail in cleaned_details)
+                    + format_llm_evidence_bullets(cleaned_details)
                 ),
             },
         ],
         "temperature": 0,
-        "max_tokens": 500,
+        "max_tokens": LLM_SUMMARY_MAX_TOKENS,
     }
     summary, error = query_llm_chat_summary(payload)
     return ioc, normalize_siyubo_llm_summary(summary), error
@@ -2024,12 +2043,12 @@ def query_ai_evidence_llm_summary_one(ioc: str, details: list[str]) -> tuple[str
                     "请汇总为一句完整的情报研判依据，长度50字左右，必须以句号结尾，不要输出半句话或泛化短语。"
                     "若信息不足以形成依据，请返回空字符串。\n\n"
                     "key_evidence如下：\n"
-                    + "\n".join(f"- {detail}" for detail in cleaned_details)
+                    + format_llm_evidence_bullets(cleaned_details)
                 ),
             },
         ],
         "temperature": 0,
-        "max_tokens": 120,
+        "max_tokens": LLM_SUMMARY_MAX_TOKENS,
     }
     summary, error = query_llm_chat_summary(payload)
     normalized_summary, reject_reason = normalize_ai_llm_summary_with_reason(summary)
@@ -2477,12 +2496,19 @@ def print_stats(decisions: list[RowDecision]) -> None:
     print(f"    规则命中：{dict(rule_counter)}")
 
 
-def print_failure_summary(title: str, failures: list[str], max_items: int | None = 20) -> None:
+def print_failure_summary(
+    title: str,
+    failures: list[str],
+    max_items: int | None = 20,
+    count_only: bool = False,
+) -> None:
     if not failures:
         return
     unique_failures = list(dict.fromkeys(failures))
     print(f"\n[!] {title}")
     print(f"    总数：{len(unique_failures)}")
+    if count_only:
+        return
     items = unique_failures if max_items is None else unique_failures[:max_items]
     for item in items:
         print(f"    {item}")
