@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import ipaddress
 import json
 import os
 import random
@@ -19,6 +20,7 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from threading import Lock, local
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -503,17 +505,19 @@ def extract_child_report_link_values(row: dict[str, Any]) -> list[Any]:
     return values
 
 
-def collect_xmon_report_links(row: dict[str, Any]) -> list[Any]:
-    values = extract_main_report_link_values(row)
-    if values:
-        return values
+def collect_xmon_report_links(row: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for value in extract_main_report_link_values(row):
+        candidates.extend(build_report_candidates(value, source="main"))
 
     child_rows = row.get("__tagmon_children")
     if isinstance(child_rows, list):
         for child in child_rows:
             if isinstance(child, dict):
-                values.extend(extract_child_report_link_values(child))
-    return values
+                utime = child.get("utime")
+                for value in extract_child_report_link_values(child):
+                    candidates.extend(build_report_candidates(value, source="sub", timestamp=report_timestamp_from_value(utime)))
+    return candidates
 
 
 def normalize_xmon_row(ioc: str, row: dict[str, Any]) -> XmonInfo:
@@ -1533,7 +1537,113 @@ def split_report_links(report_links: Any) -> list[str]:
     return list(dict.fromkeys(links))
 
 
-REPORT_URL_RE = re.compile(r"https?://[^\s\"'<>，；、（）()]+")
+REPORT_DEFAULT_TIMESTAMP = 0
+REPORT_URL_RE = re.compile(r"https?://[^\s\"'<>，；、（）()\\\\]+")
+REPORT_DATETIME_PATTERNS = (
+    re.compile(r"(?P<date>\d{4}[-/]\d{1,2}[-/]\d{1,2})(?:[T_\s]+(?P<time>\d{1,2}[:：]\d{1,2}(?:[:：]\d{1,2})?))?"),
+    re.compile(r"(?P<date>\d{8})[_-]?(?P<time>\d{6})"),
+)
+REPORT_HOST_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.IGNORECASE)
+
+
+def clean_report_url(url: str) -> str:
+    text = normalize_cell(url).strip().strip("\"'").rstrip(".,;，；。")
+    if not text:
+        return ""
+    for marker in ("@Version:", "@version:", "@VERSION:", "@"):
+        if marker in text:
+            text = text.split(marker, 1)[0]
+            break
+    if "#" in text:
+        text = text.split("#", 1)[0]
+    return text.rstrip(".,;，；。")
+
+
+def is_valid_report_url(url: str) -> bool:
+    if not url or re.search(r"\s|\\", url):
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    if parsed.username or parsed.password:
+        return False
+    try:
+        if parsed.port is not None and not (1 <= parsed.port <= 65535):
+            return False
+    except ValueError:
+        return False
+
+    host = (parsed.hostname or "").strip().rstrip(".")
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return bool(REPORT_HOST_RE.fullmatch(host))
+
+
+def report_timestamp_from_value(value: Any) -> int:
+    text = normalize_cell(value)
+    if not text:
+        return REPORT_DEFAULT_TIMESTAMP
+
+    numeric = text.strip()
+    if re.fullmatch(r"\d+(?:\.\d+)?", numeric):
+        try:
+            timestamp = int(float(numeric))
+            if timestamp > 10_000_000_000:
+                timestamp = timestamp // 1000
+            return timestamp if timestamp > 0 else REPORT_DEFAULT_TIMESTAMP
+        except Exception:
+            pass
+
+    best_timestamp = REPORT_DEFAULT_TIMESTAMP
+    for pattern in REPORT_DATETIME_PATTERNS:
+        for match in pattern.finditer(text):
+            date_part = match.group("date")
+            time_part = match.groupdict().get("time") or "00:00:00"
+            try:
+                if len(date_part) == 8:
+                    normalized = f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]} {time_part[:2]}:{time_part[2:4]}:{time_part[4:6]}"
+                else:
+                    if time_part.count(":") == 1 or time_part.count("：") == 1:
+                        time_part = f"{time_part}:00"
+                    normalized = f"{date_part.replace('/', '-')} {time_part.replace('：', ':')}"
+                dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S")
+                best_timestamp = max(best_timestamp, int(dt.replace(tzinfo=timezone.utc).timestamp()))
+            except Exception:
+                continue
+    return best_timestamp
+
+
+def iter_report_text_values(value: Any) -> list[Any]:
+    data = parse_literal_or_json(value)
+    if isinstance(data, dict):
+        values: list[Any] = list(data.keys()) + list(data.values())
+    elif isinstance(data, list):
+        values = data
+    else:
+        values = [data]
+    return values
+
+
+def build_report_candidates(value: Any, source: str = "", timestamp: int | None = None) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for item in iter_report_text_values(value):
+        if isinstance(item, (dict, list)):
+            candidates.extend(build_report_candidates(item, source=source, timestamp=timestamp))
+            continue
+        text = stringify(item)
+        item_timestamp = report_timestamp_from_value(text) if timestamp is None else timestamp
+        for match in REPORT_URL_RE.findall(text):
+            url = clean_report_url(match)
+            if is_valid_report_url(url):
+                candidates.append({"url": url, "timestamp": item_timestamp, "source": source})
+    return candidates
 
 
 def extract_report_urls(value: Any) -> list[str]:
@@ -1553,25 +1663,32 @@ def extract_report_urls(value: Any) -> list[str]:
         text = stringify(item)
         for match in REPORT_URL_RE.findall(text):
             url = normalize_report_url(match)
-            parsed = urlparse(url)
-            if parsed.scheme in {"http", "https"} and parsed.netloc:
+            if is_valid_report_url(url):
                 urls.append(url)
     return list(dict.fromkeys(urls))
 
 
 def normalize_report_url(url: str) -> str:
-    text = normalize_cell(url).rstrip(".,;，；。")
-    if not text:
-        return ""
-    if text.startswith(("http://", "https://")) and "#" in text:
-        text = text.split("#", 1)[0]
-    return text
+    return clean_report_url(url)
 
 
 def pick_first_report(report_links: Any) -> str:
-    for url in extract_report_urls(report_links):
-        return url
-    return ""
+    if isinstance(report_links, list) and all(isinstance(item, dict) and "url" in item for item in report_links):
+        candidates = report_links
+    else:
+        candidates = build_report_candidates(report_links)
+
+    best_url = ""
+    best_timestamp = -1
+    for candidate in candidates:
+        url = normalize_report_url(candidate.get("url", ""))
+        if not is_valid_report_url(url):
+            continue
+        timestamp = safe_int(candidate.get("timestamp"), REPORT_DEFAULT_TIMESTAMP)
+        if timestamp > best_timestamp:
+            best_url = url
+            best_timestamp = timestamp
+    return best_url
 
 
 def all_xmon_text(xmon_info: XmonInfo) -> str:
