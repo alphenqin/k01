@@ -108,7 +108,7 @@ SIYUBO_EVIDENCE_PROMPT = (
     "请先判断evidence_chain中的detail是否能支持该IOC为恶意或风险IOC。"
     "如果能支持恶意或风险研判，只输出一条50字左右的情报研判依据。"
     "如果不能支持恶意或风险研判，或只是备案正常、证书正常、DNS稳定、样本clean/safe、"
-    f"未发现恶意、信息不足、无法研判等内容，只输出：{SIYUBO_NO_RESULT}。"
+    f"未发现恶意、信息不足、无法研判，或显示IOC已sinkhole/被sinkhole等内容，只输出：{SIYUBO_NO_RESULT}。"
     "不要输出判断过程、编号、前缀或解释。"
 )
 AI_NO_RESULT_TERMS = ("无法研判", "无法判断", "不能研判", "信息有限", "无对应研判结果", "信息不足", "空字符串")
