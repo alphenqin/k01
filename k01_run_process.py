@@ -34,9 +34,9 @@ from requests.adapters import HTTPAdapter
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR = os.path.join(BASE_DIR, "input")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-OUTPUT_DATE = time.strftime("%Y-%m-%d")
-RESULT_FILE = os.getenv("K01_RESULT_FILE", os.path.join(OUTPUT_DIR, f"k01_result_{OUTPUT_DATE}.xlsx"))
-ANALYSIS_FILE = os.getenv("K01_ANALYSIS_FILE", os.path.join(OUTPUT_DIR, f"k01_analysis_{OUTPUT_DATE}.xlsx"))
+OUTPUT_TIME_SUFFIX = time.strftime("%Y%m%d_%H%M%S")
+RESULT_FILE = os.getenv("K01_RESULT_FILE", os.path.join(OUTPUT_DIR, f"k01_result_{OUTPUT_TIME_SUFFIX}.xlsx"))
+ANALYSIS_FILE = os.getenv("K01_ANALYSIS_FILE", os.path.join(OUTPUT_DIR, f"k01_analysis_{OUTPUT_TIME_SUFFIX}.xlsx"))
 
 VENDOR = "360"
 
@@ -156,6 +156,7 @@ AI_RETRY_SLEEP_SECONDS = 5.0  # 智能体证据链重试退避基准秒数；实
 LLM_WORKERS = 24  # 大模型接口并发数；外部模型接口不宜过高。
 LLM_RETRIES = 3  # 大模型接口失败后的重试次数。
 LLM_RETRY_SLEEP_SECONDS = 2.0  # 大模型接口重试等待秒数。
+FAILED_IOC_RERUNS = 2  # 异常 IOC 全流程额外重跑轮数；1 表示首次失败后再从头补跑 1 轮。
 SLEEP_SECONDS = 0.05  # 串行分支中每次请求后的短暂停顿，降低接口压力。
 LIMIT = 0  # 调试用输入行数限制；0 表示不限制，处理全部输入。
 XMON_MIN_SEVERITY = 30  # xmon 有效线索最低 severity 阈值；当前规则为 severity > 30。
@@ -2183,10 +2184,9 @@ def query_ai_evidence_llm_summary_one(ioc: str, details: list[str]) -> tuple[str
             {
                 "role": "user",
                 "content": (
-                    "以下是已删除噪声关键词后的智能体 key_evidence。"
-                    "请汇总为一句完整的情报研判依据，长度50字左右，必须以句号结尾，不要输出半句话或泛化短语。"
-                    "若信息不足以形成依据，请返回空字符串。不要输出安全声明、伦理声明、拒答说明或无关建议。\n\n"
-                    "key_evidence如下：\n"
+                    "将以下内容汇总为一句完整的情报研判依据，长度50字左右，必须以句号结尾，不要输出半句话或泛化短语。"
+                    "若信息不足以形成依据，请返回空字符串。不要输出安全声明、伦理声明、拒答说明或无关建议。"
+                    "\n\n\n"
                     + format_llm_evidence_bullets(cleaned_details)
                 ),
             },
@@ -2673,6 +2673,180 @@ def print_query_failures() -> None:
     print_failure_summary("智能体证据链大模型总结不合规 IOC", AI_LLM_REJECTED_SUMMARIES, max_items=50)
 
 
+def failure_item_ioc(item: str) -> str:
+    return normalize_cell(item.split("|", 1)[0])
+
+
+def failure_iocs(failures: list[str]) -> set[str]:
+    return {ioc for ioc in (failure_item_ioc(item) for item in failures) if ioc}
+
+
+def remove_failure_items(failures: list[str], iocs: set[str]) -> None:
+    if not iocs:
+        return
+    failures[:] = [item for item in failures if failure_item_ioc(item) not in iocs]
+
+
+def failure_hashes() -> set[str]:
+    hashes: set[str] = set()
+    for item in HASH_FAILED_QUERIES:
+        query_text = failure_item_ioc(item)
+        for value in query_text.split(","):
+            hash_value = normalize_cell(value)
+            if hash_value:
+                hashes.add(hash_value)
+    return hashes
+
+
+def remove_hash_failure_items(hashes: set[str]) -> None:
+    if not hashes:
+        return
+    HASH_FAILED_QUERIES[:] = [
+        item
+        for item in HASH_FAILED_QUERIES
+        if not any(normalize_cell(value) in hashes for value in failure_item_ioc(item).split(","))
+    ]
+
+
+def collect_failed_iocs_for_rerun(xmon_map: dict[str, XmonInfo]) -> list[str]:
+    failed_iocs: set[str] = set()
+    for failures in (
+        XMON_FAILED_IOCS,
+        TAGMON_FAILED_IOCS,
+        WFY_FAILED_QUERIES,
+        SC_FAILED_IOCS,
+        WD_FAILED_IOCS,
+        LLM_FAILED_IOCS,
+        SIYUBO_LLM_REJECTED_SUMMARIES,
+        AI_FAILED_IOCS,
+        AI_LLM_REJECTED_SUMMARIES,
+    ):
+        failed_iocs.update(failure_iocs(failures))
+
+    hash_values = failure_hashes()
+    if hash_values:
+        for ioc, xmon_info in xmon_map.items():
+            if set(extract_hashes_from_xmon_info(xmon_info)).intersection(hash_values):
+                failed_iocs.add(ioc)
+    return list(dict.fromkeys(ioc for ioc in failed_iocs if ioc))
+
+
+def clear_failed_records_for_iocs(iocs: set[str], xmon_map: dict[str, XmonInfo]) -> None:
+    if not iocs:
+        return
+    for failures in (
+        XMON_FAILED_IOCS,
+        TAGMON_FAILED_IOCS,
+        WFY_FAILED_QUERIES,
+        SC_FAILED_IOCS,
+        WD_FAILED_IOCS,
+        LLM_FAILED_IOCS,
+        SIYUBO_LLM_REJECTED_SUMMARIES,
+        AI_FAILED_IOCS,
+        AI_LLM_REJECTED_SUMMARIES,
+    ):
+        remove_failure_items(failures, iocs)
+
+    hashes = {
+        hash_value
+        for ioc in iocs
+        for hash_value in extract_hashes_from_xmon_info(xmon_map.get(ioc, empty_xmon_info(ioc)))
+    }
+    remove_hash_failure_items(hashes)
+
+
+def retry_failed_iocs_from_start(
+    session: Session,
+    all_iocs: list[str],
+    xmon_map: dict[str, XmonInfo],
+    hash_map: dict[str, HashInfo],
+    wfy_map: dict[str, dict[str, Any]],
+    sc_map: dict[str, bool],
+    wd_map: dict[str, WdInfo],
+    siyubo_summary_map: dict[str, str],
+    ai_map: dict[str, AiInfo],
+) -> None:
+    if FAILED_IOC_RERUNS <= 0:
+        return
+
+    allowed_iocs = set(all_iocs)
+    retry_iocs = [ioc for ioc in collect_failed_iocs_for_rerun(xmon_map) if ioc in allowed_iocs]
+    for round_index in range(1, FAILED_IOC_RERUNS + 1):
+        if not retry_iocs:
+            break
+        retry_ioc_set = set(retry_iocs)
+        clear_failed_records_for_iocs(retry_ioc_set, xmon_map)
+        print(f"\n[+] 异常 IOC 全流程重跑第 {round_index}/{FAILED_IOC_RERUNS} 轮：{len(retry_iocs)} 条")
+
+        retry_xmon_map = query_xmon_iocs(session, retry_iocs)
+        xmon_map.update(retry_xmon_map)
+
+        retry_hashes: list[str] = []
+        for ioc in retry_iocs:
+            retry_hashes.extend(extract_hashes_from_xmon_info(xmon_map.get(ioc, empty_xmon_info(ioc))))
+        retry_unique_hashes = list(dict.fromkeys(hash_value for hash_value in retry_hashes if hash_value))
+        if retry_unique_hashes:
+            hash_map.update(query_hashes(session, retry_unique_hashes))
+
+        wfy_map.update(query_wfy(session, retry_iocs))
+        retry_black_iocs = [ioc for ioc in retry_iocs if wfy_is_black(wfy_map.get(ioc, {}))]
+
+        if retry_black_iocs:
+            sc_map.update(query_sc(session, retry_black_iocs))
+
+        wd_candidate_iocs = [
+            ioc
+            for ioc in retry_black_iocs
+            if not {"atateam", "siyubo"}.intersection(xmon_owner_candidates(xmon_map.get(ioc, empty_xmon_info(ioc))))
+        ]
+        if wd_candidate_iocs:
+            wd_map.update(query_wd(session, wd_candidate_iocs))
+
+        retry_siyubo_evidence_details_map: dict[str, list[str]] = {}
+        for ioc in retry_iocs:
+            xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
+            wfy_info = wfy_map.get(ioc, {})
+            wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
+            owner = classify_owner(xmon_info, wfy_info, wd_info, sc_map.get(ioc, False))
+            if owner != "siyubo":
+                continue
+            if is_wd_snapshot_rule_hit(xmon_info, wd_info):
+                continue
+            if has_black_hash_evidence(xmon_info, hash_map):
+                continue
+            if pick_first_report(xmon_info.report_links):
+                continue
+            details = extract_siyubo_evidence_details(xmon_info)
+            if details:
+                retry_siyubo_evidence_details_map[ioc] = details
+        siyubo_summary_map.update(query_siyubo_llm_summaries(retry_siyubo_evidence_details_map))
+
+        retry_ai_candidate_iocs: list[str] = []
+        for ioc in retry_iocs:
+            xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
+            wfy_info = wfy_map.get(ioc, {})
+            wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
+            if not wfy_is_black(wfy_info):
+                continue
+            if has_black_hash_evidence(xmon_info, hash_map):
+                continue
+            if pick_first_report(xmon_info.report_links):
+                continue
+            owner = classify_owner(xmon_info, wfy_info, wd_info, sc_map.get(ioc, False))
+            if owner == "wd" and is_wd_snapshot_rule_hit(xmon_info, wd_info):
+                continue
+            if siyubo_summary_map.get(ioc):
+                continue
+            retry_ai_candidate_iocs.append(ioc)
+        if retry_ai_candidate_iocs:
+            ai_map.update(query_ai_quick_analysis(retry_ai_candidate_iocs))
+
+        remaining_iocs = set(collect_failed_iocs_for_rerun(xmon_map)).intersection(retry_ioc_set)
+        recovered_count = len(retry_ioc_set) - len(remaining_iocs)
+        print(f"[+] 异常 IOC 全流程重跑恢复：{recovered_count} 条，仍异常：{len(remaining_iocs)} 条")
+        retry_iocs = [ioc for ioc in retry_iocs if ioc in remaining_iocs]
+
+
 def remove_old_outputs() -> None:
     for path in (RESULT_FILE, ANALYSIS_FILE):
         if not os.path.exists(path):
@@ -2813,6 +2987,17 @@ def main() -> None:
             continue
         ai_candidate_iocs.append(ioc)
     ai_map = query_ai_quick_analysis(ai_candidate_iocs) if ai_candidate_iocs else {}
+    retry_failed_iocs_from_start(
+        session,
+        ioc_list,
+        xmon_map,
+        hash_map,
+        wfy_map,
+        sc_map,
+        wd_map,
+        siyubo_summary_map,
+        ai_map,
+    )
     finish_stage("查询智能体证据链", stage_time)
 
     stage_time = start_stage("生成研判结果")
