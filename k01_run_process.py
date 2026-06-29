@@ -2640,18 +2640,24 @@ def retry_failed_iocs_from_start(
         clear_failed_records_for_iocs(retry_ioc_set, xmon_map)
         print(f"\n[+] 异常 IOC 全流程重跑第 {round_index}/{FAILED_IOC_RERUNS} 轮：{len(retry_iocs)} 条")
 
-        retry_xmon_map = query_xmon_iocs(session, retry_iocs)
+        wfy_map.update(query_wfy(session, retry_iocs))
+        retry_black_iocs = [ioc for ioc in retry_iocs if wfy_is_black(wfy_map.get(ioc, {}))]
+        if not retry_black_iocs:
+            remaining_iocs = set(collect_failed_iocs_for_rerun(xmon_map)).intersection(retry_ioc_set)
+            recovered_count = len(retry_ioc_set) - len(remaining_iocs)
+            print(f"[+] 异常 IOC 全流程重跑恢复：{recovered_count} 条，仍异常：{len(remaining_iocs)} 条")
+            retry_iocs = [ioc for ioc in retry_iocs if ioc in remaining_iocs]
+            continue
+
+        retry_xmon_map = query_xmon_iocs(session, retry_black_iocs)
         xmon_map.update(retry_xmon_map)
 
         retry_hashes: list[str] = []
-        for ioc in retry_iocs:
+        for ioc in retry_black_iocs:
             retry_hashes.extend(extract_hashes_from_xmon_info(xmon_map.get(ioc, empty_xmon_info(ioc))))
         retry_unique_hashes = list(dict.fromkeys(hash_value for hash_value in retry_hashes if hash_value))
         if retry_unique_hashes:
             hash_map.update(query_hashes(session, retry_unique_hashes))
-
-        wfy_map.update(query_wfy(session, retry_iocs))
-        retry_black_iocs = [ioc for ioc in retry_iocs if wfy_is_black(wfy_map.get(ioc, {}))]
 
         if retry_black_iocs:
             sc_map.update(query_sc(session, retry_black_iocs))
@@ -2665,7 +2671,7 @@ def retry_failed_iocs_from_start(
             wd_map.update(query_wd(session, wd_candidate_iocs))
 
         retry_siyubo_evidence_details_map: dict[str, list[str]] = {}
-        for ioc in retry_iocs:
+        for ioc in retry_black_iocs:
             xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
             wfy_info = wfy_map.get(ioc, {})
             wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
@@ -2684,12 +2690,10 @@ def retry_failed_iocs_from_start(
         siyubo_summary_map.update(query_siyubo_llm_summaries(retry_siyubo_evidence_details_map))
 
         retry_ai_candidate_iocs: list[str] = []
-        for ioc in retry_iocs:
+        for ioc in retry_black_iocs:
             xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
             wfy_info = wfy_map.get(ioc, {})
             wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
-            if not wfy_is_black(wfy_info):
-                continue
             if has_black_hash_evidence(xmon_info, hash_map):
                 continue
             if pick_first_report(xmon_info.report_links):
@@ -2770,8 +2774,15 @@ def main() -> None:
     finish_stage("读取输入", stage_time)
 
     session = make_session()
+
+    stage_time = start_stage("查询 wfy")
+    wfy_map = query_wfy(session, ioc_list)
+    black_iocs = [ioc for ioc in ioc_list if wfy_is_black(wfy_map.get(ioc, {}))]
+    print(f"[+] wfy black IOC：{len(black_iocs)} 条")
+    finish_stage("查询 wfy", stage_time)
+
     stage_time = start_stage("查询 xmon 主线索和子线索")
-    xmon_map = query_xmon_iocs(session, ioc_list)
+    xmon_map = query_xmon_iocs(session, black_iocs) if black_iocs else {}
     finish_stage("查询 xmon 主线索和子线索", stage_time)
 
     stage_time = start_stage("提取并查询 hash 文件情报")
@@ -2787,12 +2798,6 @@ def main() -> None:
     black_hash_count = sum(1 for info in hash_map.values() if risk_is_black(info.risk))
     print(f"[+] hash 文件情报命中：{hash_hit_count}/{len(unique_hashes)}，黑样本 hash：{black_hash_count}")
     finish_stage("提取并查询 hash 文件情报", stage_time)
-
-    stage_time = start_stage("查询 wfy")
-    wfy_map = query_wfy(session, ioc_list)
-    black_iocs = [ioc for ioc in ioc_list if wfy_is_black(wfy_map.get(ioc, {}))]
-    print(f"[+] wfy black IOC：{len(black_iocs)} 条")
-    finish_stage("查询 wfy", stage_time)
 
     stage_time = start_stage("查询 sc")
     sc_map = query_sc(session, black_iocs) if black_iocs else {}
@@ -2810,7 +2815,7 @@ def main() -> None:
 
     stage_time = start_stage("总结 siyubo evidence_chain")
     siyubo_evidence_details_map: dict[str, list[str]] = {}
-    for ioc in ioc_list:
+    for ioc in black_iocs:
         xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
         wfy_info = wfy_map.get(ioc, {})
         wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
@@ -2832,12 +2837,10 @@ def main() -> None:
 
     stage_time = start_stage("查询智能体证据链")
     ai_candidate_iocs: list[str] = []
-    for ioc in ioc_list:
+    for ioc in black_iocs:
         xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
         wfy_info = wfy_map.get(ioc, {})
         wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
-        if not wfy_is_black(wfy_info):
-            continue
         if has_black_hash_evidence(xmon_info, hash_map):
             continue
         if pick_first_report(xmon_info.report_links):
