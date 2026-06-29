@@ -2255,12 +2255,18 @@ def decide_row(
     decision.owner = classify_owner(xmon_info, wfy_info, wd_info, sc_malicious)
 
     if not wfy_is_black(wfy_info):
+        if ai_info and ai_info.summary:
+            decision.k01_result = "有效"
+            decision.info_add = ai_info.summary
+            decision.solvable = "能"
+            decision.solution = "智能体证据链"
+            decision.rule_hit = "ai_evidence_chain"
+            decision.hit_rule = "智能体证据链"
+            return finalize_decision(decision)
         decision.k01_result = ""
-        decision.info_add = "wfy接口查询未显示恶意"
         decision.solvable = "否"
-        decision.solution = "wfy接口查询未显示恶意"
-        decision.rule_hit = "wfy_not_black"
-        decision.hit_rule = "wfy未报告恶意"
+        decision.solution = "无更多依据关联"
+        decision.rule_hit = "no_more_evidence"
         return finalize_decision(decision)
 
     if black_hash:
@@ -2648,24 +2654,17 @@ def retry_failed_iocs_from_start(
 
         wfy_map.update(query_wfy(session, retry_iocs))
         retry_black_iocs = [ioc for ioc in retry_iocs if wfy_is_black(wfy_map.get(ioc, {}))]
-        if not retry_black_iocs:
-            remaining_iocs = set(collect_failed_iocs_for_rerun(xmon_map)).intersection(retry_ioc_set)
-            recovered_count = len(retry_ioc_set) - len(remaining_iocs)
-            print(f"[+] 异常 IOC 全流程重跑恢复：{recovered_count} 条，仍异常：{len(remaining_iocs)} 条")
-            retry_iocs = [ioc for ioc in retry_iocs if ioc in remaining_iocs]
-            continue
-
-        retry_xmon_map = query_xmon_iocs(session, retry_black_iocs)
-        xmon_map.update(retry_xmon_map)
-
-        retry_hashes: list[str] = []
-        for ioc in retry_black_iocs:
-            retry_hashes.extend(extract_hashes_from_xmon_info(xmon_map.get(ioc, empty_xmon_info(ioc))))
-        retry_unique_hashes = list(dict.fromkeys(hash_value for hash_value in retry_hashes if hash_value))
-        if retry_unique_hashes:
-            hash_map.update(query_hashes(session, retry_unique_hashes))
-
         if retry_black_iocs:
+            retry_xmon_map = query_xmon_iocs(session, retry_black_iocs)
+            xmon_map.update(retry_xmon_map)
+
+            retry_hashes: list[str] = []
+            for ioc in retry_black_iocs:
+                retry_hashes.extend(extract_hashes_from_xmon_info(xmon_map.get(ioc, empty_xmon_info(ioc))))
+            retry_unique_hashes = list(dict.fromkeys(hash_value for hash_value in retry_hashes if hash_value))
+            if retry_unique_hashes:
+                hash_map.update(query_hashes(session, retry_unique_hashes))
+
             sc_map.update(query_sc(session, retry_black_iocs))
 
         wd_candidate_iocs = [
@@ -2696,7 +2695,10 @@ def retry_failed_iocs_from_start(
         siyubo_summary_map.update(query_siyubo_llm_summaries(retry_siyubo_evidence_details_map))
 
         retry_ai_candidate_iocs: list[str] = []
-        for ioc in retry_black_iocs:
+        for ioc in retry_iocs:
+            if not wfy_is_black(wfy_map.get(ioc, {})):
+                retry_ai_candidate_iocs.append(ioc)
+                continue
             xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
             wfy_info = wfy_map.get(ioc, {})
             wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
@@ -2747,7 +2749,20 @@ def build_analysis_owner_ai_sheet(detail_df: pd.DataFrame, owner: str) -> pd.Dat
     return filtered.drop(columns=["相关解决方案"])
 
 
-def write_analysis_excel(detail_df: pd.DataFrame, summary_df: pd.DataFrame, path: str) -> None:
+def build_wfy_no_k01_sheet(detail_df: pd.DataFrame, wfy_map: dict[str, dict[str, Any]]) -> pd.DataFrame:
+    filtered = detail_df[~detail_df["ioc"].map(lambda ioc: wfy_is_black(wfy_map.get(ioc, {})))].copy()
+    filtered["生产方归属"] = "wfy_no_k01"
+    filtered["能否解决"] = "wfy未报告恶意"
+    filtered = filtered.rename(columns={"能否解决": "问题情况"})
+    return filtered.drop(columns=["相关解决方案"])
+
+
+def write_analysis_excel(
+    detail_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    path: str,
+    wfy_map: dict[str, dict[str, Any]],
+) -> None:
     try:
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             detail_df.to_excel(writer, sheet_name="明细", index=False)
@@ -2755,6 +2770,8 @@ def write_analysis_excel(detail_df: pd.DataFrame, summary_df: pd.DataFrame, path
             for owner in ANALYSIS_OWNER_SHEETS:
                 owner_df = build_analysis_owner_ai_sheet(detail_df, owner)
                 owner_df.to_excel(writer, sheet_name=owner, index=False)
+            wfy_no_k01_df = build_wfy_no_k01_sheet(detail_df, wfy_map)
+            wfy_no_k01_df.to_excel(writer, sheet_name="wfy_no_k01", index=False)
     except PermissionError as exc:
         raise PermissionError(f"无法写入输出文件：{path}。请先关闭 Excel/WPS 中打开的该文件后重试。") from exc
 
@@ -2843,7 +2860,10 @@ def main() -> None:
 
     stage_time = start_stage("查询智能体证据链")
     ai_candidate_iocs: list[str] = []
-    for ioc in black_iocs:
+    for ioc in ioc_list:
+        if not wfy_is_black(wfy_map.get(ioc, {})):
+            ai_candidate_iocs.append(ioc)
+            continue
         xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
         wfy_info = wfy_map.get(ioc, {})
         wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
@@ -2902,7 +2922,7 @@ def main() -> None:
     analysis_summary_df = pd.DataFrame(build_analysis_summary_rows(decisions, wfy_map), columns=ANALYSIS_SUMMARY_COLUMNS)
 
     write_excel_file(result_df, RESULT_FILE)
-    write_analysis_excel(analysis_df, analysis_summary_df, ANALYSIS_FILE)
+    write_analysis_excel(analysis_df, analysis_summary_df, ANALYSIS_FILE, wfy_map)
 
     print(f"[+] 输出完成：{RESULT_FILE}")
     print(f"[+] 输出完成：{ANALYSIS_FILE}")
