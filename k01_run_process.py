@@ -333,6 +333,12 @@ def normalize_cell(value: Any) -> str:
     return text
 
 
+def normalize_epoch_seconds(value: int) -> int:
+    if value > 10_000_000_000:
+        return value // 1000
+    return value
+
+
 def make_session() -> Session:
     session = requests.Session()
     adapter = HTTPAdapter(
@@ -364,8 +370,7 @@ def timestamp_to_date(ts: Any) -> str:
         value = int(float(str(ts).strip()))
         if value <= 0:
             return ""
-        if value > 10_000_000_000:
-            value = value // 1000
+        value = normalize_epoch_seconds(value)
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
     except Exception:
         return normalize_cell(ts)
@@ -460,13 +465,6 @@ def has_meaningful_value(value: Any) -> bool:
     if isinstance(value, (list, dict)):
         return len(value) > 0
     return bool(normalize_cell(value))
-
-
-def first_raw_not_empty(*values: Any) -> Any:
-    for value in values:
-        if has_meaningful_value(value):
-            return value
-    return ""
 
 
 def extract_xmon_disable(row: dict[str, Any], raw: dict[str, Any]) -> str:
@@ -659,26 +657,6 @@ def build_xmon_valid_clues(main_row: dict[str, Any], child_rows: list[dict[str, 
     return valid_clues
 
 
-def query_xmon_tagmon_children(session: Session, ioc: str) -> list[dict[str, Any]]:
-    if not XMON_TAGMON_ENABLED or not ioc:
-        return []
-    url = build_xmon_tagmon_url(ioc)
-    last_error = ""
-    max_attempts = XMON_TAGMON_RETRIES + 1
-    for attempt in range(1, max_attempts + 1):
-        if attempt > 1:
-            time.sleep(XMON_TAGMON_RETRY_SLEEP)
-        try:
-            resp = session.get(url, headers=XMON_HEADERS, verify=False, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            return extract_xmon_rows(safe_json_response(resp))
-        except Exception as exc:
-            last_error = str(exc)
-    with TAGMON_FAILED_LOCK:
-        TAGMON_FAILED_IOCS.append(f"{ioc} | {last_error}")
-    return []
-
-
 def query_xmon_tagmon_batch(batch: list[str]) -> tuple[list[str], dict[str, list[dict[str, Any]]], str]:
     if not XMON_TAGMON_ENABLED or not batch:
         return batch, {ioc: [] for ioc in batch}, ""
@@ -699,10 +677,6 @@ def query_xmon_tagmon_batch(batch: list[str]) -> tuple[list[str], dict[str, list
         except Exception as exc:
             last_error = str(exc)
     return batch, {ioc: [] for ioc in batch}, last_error
-
-
-def query_xmon_tagmon_children_worker(ioc: str) -> list[dict[str, Any]]:
-    return query_xmon_tagmon_children(get_thread_session(), ioc)
 
 
 def query_xmon_tagmon_children_many(iocs: list[str]) -> dict[str, list[dict[str, Any]]]:
@@ -741,29 +715,6 @@ def query_xmon_tagmon_children_many(iocs: list[str]) -> dict[str, list[dict[str,
                 for ioc in batch:
                     result_map[ioc] = []
     return result_map
-
-
-def query_xmon_one(ioc: str) -> tuple[str, XmonInfo, bool, str]:
-    session = get_thread_session()
-    url = build_xmon_batch_url([ioc])
-    try:
-        resp = session.get(url, headers=XMON_HEADERS, verify=False, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        rows = extract_xmon_rows(safe_json_response(resp))
-        if not rows:
-            return ioc, empty_xmon_info(ioc), True, ""
-
-        for row in rows:
-            main_ioc = normalize_cell(row.get("ioc", ""))
-            child_rows = query_xmon_tagmon_children(session, main_ioc)
-            enriched_row = dict(row)
-            enriched_row["__tagmon_children"] = child_rows
-            enriched_row["__valid_clues"] = build_xmon_valid_clues(row, child_rows, ioc)
-            return ioc, normalize_xmon_row(ioc, enriched_row), True, ""
-
-        return ioc, empty_xmon_info(ioc), True, ""
-    except Exception as exc:
-        return ioc, empty_xmon_info(ioc), False, str(exc)
 
 
 def query_xmon_main_batch(batch: list[str]) -> tuple[list[str], dict[str, list[dict[str, Any]]], str]:
@@ -1114,13 +1065,6 @@ def sc_category_for_ioc(ioc: str) -> str:
     if text.startswith(("http://", "https://")):
         return "url"
     return SC_DEFAULT_CATEGORY
-
-
-def query_custom_tags(session: Session, ioc: str, category: str | None = None) -> dict[str, Any]:
-    batch, parsed, error = query_custom_tags_batch(session, [ioc], category)
-    if error:
-        return {"query_error": error}
-    return parsed.get(ioc, {})
 
 
 def query_custom_tags_batch(
@@ -1490,20 +1434,6 @@ def wfy_is_black(wfy_info: dict[str, Any]) -> bool:
     return judge == "black"
 
 
-def wfy_is_white(wfy_info: dict[str, Any]) -> bool:
-    judge = normalize_cell(first_not_empty(wfy_info.get("judge"), wfy_info.get("verdict"), wfy_info.get("label"))).lower()
-    return judge == "white"
-
-
-def wfy_is_unknown(wfy_info: dict[str, Any]) -> bool:
-    if wfy_info.get("query_error"):
-        return False
-    if not wfy_info:
-        return True
-    judge = normalize_cell(first_not_empty(wfy_info.get("judge"), wfy_info.get("verdict"), wfy_info.get("label"))).lower()
-    return judge in {"", "unknown", "none", "null"}
-
-
 def risk_is_black(risk: str) -> bool:
     return normalize_cell(risk).lower() in BLACK_RISKS
 
@@ -1521,27 +1451,6 @@ def map_k01_status(xmon_status: Any) -> str:
         "SINKHOLE": "被安全机构接管",
     }
     return status_map.get(status, status)
-
-
-def split_report_links(report_links: Any) -> list[str]:
-    data = parse_literal_or_json(report_links)
-    if isinstance(data, dict):
-        values = list(data.values())
-    elif isinstance(data, list):
-        values = data
-    else:
-        values = re.split(r"[\s,;，；]+", stringify(data))
-
-    links: list[str] = []
-    for value in values:
-        text = stringify(value).strip().strip("\"'")
-        if not text or text.startswith("@Version:"):
-            continue
-        for part in re.split(r"[\s,;，；]+", text):
-            part = part.strip().strip("\"'")
-            if part:
-                links.append(part)
-    return list(dict.fromkeys(links))
 
 
 REPORT_DEFAULT_TIMESTAMP = 0
@@ -1602,8 +1511,7 @@ def report_timestamp_from_value(value: Any) -> int:
     if re.fullmatch(r"\d+(?:\.\d+)?", numeric):
         try:
             timestamp = int(float(numeric))
-            if timestamp > 10_000_000_000:
-                timestamp = timestamp // 1000
+            timestamp = normalize_epoch_seconds(timestamp)
             return timestamp if timestamp > 0 else REPORT_DEFAULT_TIMESTAMP
         except Exception:
             pass
@@ -1651,28 +1559,6 @@ def build_report_candidates(value: Any, source: str = "", timestamp: int | None 
             if is_valid_report_url(url):
                 candidates.append({"url": url, "timestamp": item_timestamp, "source": source})
     return candidates
-
-
-def extract_report_urls(value: Any) -> list[str]:
-    data = parse_literal_or_json(value)
-    if isinstance(data, dict):
-        values = list(data.keys()) + list(data.values())
-    elif isinstance(data, list):
-        values = data
-    else:
-        values = [data]
-
-    urls: list[str] = []
-    for item in values:
-        if isinstance(item, (dict, list)):
-            urls.extend(extract_report_urls(item))
-            continue
-        text = stringify(item)
-        for match in REPORT_URL_RE.findall(text):
-            url = normalize_report_url(match)
-            if is_valid_report_url(url):
-                urls.append(url)
-    return list(dict.fromkeys(urls))
 
 
 def normalize_report_url(url: str) -> str:
@@ -1858,6 +1744,15 @@ def finalize_decision(decision: RowDecision) -> RowDecision:
     return decision
 
 
+def fill_file_features(decision: RowDecision, file_hash: str, hash_info: HashInfo) -> None:
+    decision.file_hash = file_hash
+    decision.file_size = format_file_size(hash_info.file_size)
+    decision.file_type = hash_info.file_type
+    decision.operating_system = hash_info.operating_system
+    decision.create_time = hash_info.first_seen_time
+    decision.other_file_feature = hash_info.other_file_feature
+
+
 def summarize_evidence_details(details: list[str], limit: int = 50) -> str:
     cleaned: list[str] = []
     for detail in details:
@@ -1915,30 +1810,28 @@ def extract_siyubo_evidence_details(xmon_info: XmonInfo) -> list[str]:
     return list(dict.fromkeys(details))
 
 
-def normalize_siyubo_llm_summary_with_reason(summary: str) -> tuple[str, str]:
-    text = normalize_cell(summary)
+def strip_llm_summary_text(value: Any) -> str:
+    text = normalize_cell(value)
     if not text:
-        return "", "大模型返回空"
+        return ""
     text = re.sub(r"^```(?:text)?", "", text).strip()
     text = re.sub(r"```$", "", text).strip()
-    text = text.strip("\"'“”‘’")
+    return text.strip("\"'“”‘’")
+
+
+def normalize_siyubo_llm_summary_with_reason(summary: str) -> tuple[str, str]:
+    text = strip_llm_summary_text(summary)
+    if not text:
+        return "", "大模型返回空"
     if any(term in text for term in SIYUBO_NO_RESULT_TERMS) and not any(term in text for term in SIYUBO_HIT_TERMS):
         return "", "大模型判定无法形成恶意或可疑依据"
     return text, ""
 
 
-def normalize_siyubo_llm_summary(summary: str) -> str:
-    text, _ = normalize_siyubo_llm_summary_with_reason(summary)
-    return text
-
-
 def normalize_ai_llm_summary_with_reason(summary: str) -> tuple[str, str]:
-    text = normalize_cell(summary)
+    text = strip_llm_summary_text(summary)
     if not text:
         return "", "大模型返回空"
-    text = re.sub(r"^```(?:text)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    text = text.strip("\"'“”‘’")
     if any(term in text for term in AI_NO_RESULT_TERMS):
         return "", "包含无法形成依据相关词"
     if any(term in text for term in AI_REFUSAL_TERMS):
@@ -1948,11 +1841,6 @@ def normalize_ai_llm_summary_with_reason(summary: str) -> tuple[str, str]:
     if not text.endswith(AI_COMPLETE_SUMMARY_ENDINGS):
         return "", "未以完整句结束"
     return text, ""
-
-
-def normalize_ai_llm_summary(summary: str) -> str:
-    text, _ = normalize_ai_llm_summary_with_reason(summary)
-    return text
 
 
 def parse_llm_summary_response(data: Any) -> str:
@@ -2008,13 +1896,20 @@ def query_llm_chat_summary(payload: dict[str, Any]) -> tuple[str, str]:
     return "", last_error
 
 
+def build_llm_chat_payload(system_content: str, user_content: str) -> dict[str, Any]:
+    return {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0,
+        "max_tokens": LLM_SUMMARY_MAX_TOKENS,
+    }
+
+
 def normalize_wd_snapshot_llm_topic(topic: str) -> str:
-    text = normalize_cell(topic)
-    if not text:
-        return ""
-    text = re.sub(r"^```(?:text)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    return text.strip("\"'“”‘’")
+    return strip_llm_summary_text(topic)
 
 
 def query_wd_snapshot_llm_topic(ioc: str, content: str) -> tuple[str, str]:
@@ -2023,22 +1918,14 @@ def query_wd_snapshot_llm_topic(ioc: str, content: str) -> tuple[str, str]:
         return "", ""
     if ioc in WD_SNAPSHOT_TOPIC_SUMMARY_CACHE:
         return WD_SNAPSHOT_TOPIC_SUMMARY_CACHE[ioc], ""
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": "你是安全情报分析助手，只输出最终主题内容，不要解释。"},
-            {
-                "role": "user",
-                "content": (
-                    "以下是恶意快照页面内容。请总结快照主题内容，50字以内。"
-                    "不要输出前缀、编号或解释。\n\n"
-                    f"快照内容如下：\n{text[:4000]}"
-                ),
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": LLM_SUMMARY_MAX_TOKENS,
-    }
+    payload = build_llm_chat_payload(
+        "你是安全情报分析助手，只输出最终主题内容，不要解释。",
+        (
+            "以下是恶意快照页面内容。请总结快照主题内容，50字以内。"
+            "不要输出前缀、编号或解释。\n\n"
+            f"快照内容如下：\n{text[:4000]}"
+        ),
+    )
     topic, error = query_llm_chat_summary(payload)
     normalized_topic = normalize_wd_snapshot_llm_topic(topic)
     if normalized_topic:
@@ -2053,22 +1940,14 @@ def query_siyubo_llm_summary_one(ioc: str, details: list[str]) -> tuple[str, str
     if not cleaned_details:
         return ioc, "", ""
 
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": "你是安全情报分析助手，只输出最终研判依据，不要解释。"},
-            {
-                "role": "user",
-                "content": (
-                    f"{SIYUBO_EVIDENCE_PROMPT}\n\n"
-                    "evidence_chain detail如下：\n"
-                    + format_llm_evidence_bullets(cleaned_details)
-                ),
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": LLM_SUMMARY_MAX_TOKENS,
-    }
+    payload = build_llm_chat_payload(
+        "你是安全情报分析助手，只输出最终研判依据，不要解释。",
+        (
+            f"{SIYUBO_EVIDENCE_PROMPT}\n\n"
+            "evidence_chain detail如下：\n"
+            + format_llm_evidence_bullets(cleaned_details)
+        ),
+    )
     summary, error = query_llm_chat_summary(payload)
     normalized_summary, reject_reason = normalize_siyubo_llm_summary_with_reason(summary)
     if reject_reason and not error:
@@ -2183,21 +2062,10 @@ def query_ai_evidence_llm_summary_one(ioc: str, details: list[str]) -> tuple[str
     cleaned_details = [normalize_cell(detail) for detail in details if normalize_cell(detail)]
     if not cleaned_details:
         return ioc, "", ""
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": "你是安全情报分析助手，只输出最终研判依据，不要解释。"},
-            {
-                "role": "user",
-                "content": (
-                    f"{AI_EVIDENCE_PROMPT}\n\n"
-                    + format_llm_evidence_bullets(cleaned_details)
-                ),
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": LLM_SUMMARY_MAX_TOKENS,
-    }
+    payload = build_llm_chat_payload(
+        "你是安全情报分析助手，只输出最终研判依据，不要解释。",
+        f"{AI_EVIDENCE_PROMPT}\n\n" + format_llm_evidence_bullets(cleaned_details),
+    )
     summary, error = query_llm_chat_summary(payload)
     normalized_summary, reject_reason = normalize_ai_llm_summary_with_reason(summary)
     if reject_reason and not error:
@@ -2391,12 +2259,7 @@ def decide_row(
 
     if black_hash:
         decision.k01_result = "有效"
-        decision.file_hash = black_hash
-        decision.file_size = format_file_size(black_hash_info.file_size)
-        decision.file_type = black_hash_info.file_type
-        decision.operating_system = black_hash_info.operating_system
-        decision.create_time = black_hash_info.first_seen_time
-        decision.other_file_feature = black_hash_info.other_file_feature
+        fill_file_features(decision, black_hash, black_hash_info)
         decision.info_add = f"{decision.ioc}，依据ioc({decision.ioc}),关联样本（{black_hash}）"
         decision.solvable = "能"
         decision.solution = "存在黑样本关联"
@@ -2406,12 +2269,7 @@ def decide_row(
 
     if first_report:
         decision.k01_result = "有效"
-        decision.file_hash = first_hash_info.query_hash
-        decision.file_size = format_file_size(first_hash_info.file_size)
-        decision.file_type = first_hash_info.file_type
-        decision.operating_system = first_hash_info.operating_system
-        decision.create_time = first_hash_info.first_seen_time
-        decision.other_file_feature = first_hash_info.other_file_feature
+        fill_file_features(decision, first_hash_info.query_hash, first_hash_info)
         decision.info_add = f"{decision.ioc}，依据ioc({decision.ioc}),关联报告（{first_report}）"
         decision.solvable = "能"
         decision.solution = "存在关联报告关联"
