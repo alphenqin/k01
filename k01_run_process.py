@@ -1737,7 +1737,13 @@ def format_wd_snapshot_info_add(description: str, topic: str) -> str:
 def finalize_decision(decision: RowDecision) -> RowDecision:
     if decision.solution == "无更多依据关联":
         decision.solvable = "否"
-    elif decision.solution == "存在黑样本关联":
+    elif decision.solution in {
+        "存在黑样本关联",
+        "存在关联报告关联",
+        "src是wd且有快照",
+        "siyubo证据链",
+        "智能体证据链",
+    }:
         decision.solvable = "能"
     else:
         decision.solvable = "预解决"
