@@ -103,7 +103,7 @@ AI_EVIDENCE_PROMPT = (
 # ===== 大模型公共配置 =====
 LLM_API_URL = os.getenv("K01_LLM_API_URL", "https://api.360.cn/v1/chat/completions")
 LLM_MODEL = os.getenv("K01_LLM_MODEL", "deepseek/deepseek-v4-flash-internal")
-LLM_TOKEN = os.getenv("K01_LLM_TOKEN", "fk3631605771.SW4G9234O44_fCdZNjrfq4KjcJFrmini5f2f056c")  # 如需使用大模型能力，在这里或环境变量填写 token。
+LLM_TOKEN = os.getenv("K01_LLM_TOKEN", "fk3631605771.Jh8vxBCKY9nGWVCyrAQIRD9eNC5vVVRFfef19530")  # 如需使用大模型能力，在这里或环境变量填写 token。
 LLM_SUMMARY_MAX_TOKENS = 1500  # 该接口会按 max_tokens 裁剪 messages，摘要场景不要设得过低。
 LLM_EVIDENCE_MAX_INPUT_CHARS = 1000  # 主动限制证据输入长度，避免服务端不可控截断。
 
@@ -118,6 +118,25 @@ SIYUBO_EVIDENCE_PROMPT = (
     "如果完全没有恶意/风险/可疑依据，或只是备案正常、证书正常、DNS稳定、样本clean/safe、"
     f"未发现恶意、信息不足、无法研判，或显示IOC已sinkhole/被sinkhole等内容，只输出：{SIYUBO_NO_RESULT}。"
     "不要输出判断过程、编号、前缀或解释。"
+)
+ATATEAM_NO_RESULT = "证据链不合格，无法生成恶意依据。"
+ATATEAM_NO_RESULT_TERMS = ("证据链不合格", "无法生成恶意依据", "无法研判", "无法判断", "不能研判", "信息有限", "无对应研判结果")
+ATATEAM_EVIDENCE_PROMPT = (
+    "你是一名威胁情报分析专家，请根据输入的结构化证据链生成一句情报依据。"
+    "输入字段可能包含sample_behavior、source_links、related_vulnerabilities、traffic_fragments、other_evidence。"
+    "最终仅输出一句话，不输出分析过程。"
+    "必须首先说明存在哪些证据类型，证据类型可为：存在样本行为、存在开源报告提及、存在漏洞利用关联、"
+    "存在恶意流量通信关联、存在其他恶意线索；多个证据类型使用顿号连接。"
+    "随后根据各字段内容提炼关键细节，不要简单重复字段名称。"
+    "sample_behavior需总结样本与IOC关系，如被恶意样本通信、下载、释放、作为C2或被多个恶意样本关联。"
+    "source_links需识别并提炼报告来源、恶意家族、APT组织、IOC角色或重要结论，并保留对应URL，格式为（参考报告：https://xxxxx）。"
+    "related_vulnerabilities需提炼CVE编号、漏洞名称、利用方式及与IOC关联。"
+    "traffic_fragments需提炼HTTP URI、DNS、Beacon、POST、TCP、TLS、UA等通信行为。"
+    "other_evidence需总结具体恶意事实，不允许只输出存在其他恶意线索。"
+    "不得编造不存在的信息；无法确认某项内容时，仅描述已有事实。"
+    f"若所有字段均为空，或没有恶意/风险/可疑依据，只输出：{ATATEAM_NO_RESULT}"
+    "输出控制在150字以内，但必须保留关键事实，不要为了缩短而丢失恶意家族、漏洞编号、组织名称、URL等重要信息。"
+    "最终格式统一为：存在{证据类型1}、{证据类型2}……，{依据各字段提炼出的关键恶意事实}。"
 )
 AI_NO_RESULT_TERMS = ("无法研判", "无法判断", "不能研判", "信息有限", "无对应研判结果", "信息不足", "空字符串")
 AI_REFUSAL_TERMS = ("无法回答", "不能回答", "有益知识", "法律与道德", "有建设性的话题", "遵守所有相关")
@@ -209,9 +228,12 @@ WFY_FAILED_QUERIES: list[str] = []
 SC_FAILED_IOCS: list[str] = []
 WD_FAILED_IOCS: list[str] = []
 AI_FAILED_IOCS: list[str] = []
+WD_LLM_FAILED_IOCS: list[str] = []
+ATATEAM_LLM_FAILED_IOCS: list[str] = []
+ATATEAM_LLM_REJECTED_SUMMARIES: list[str] = []
+SIYUBO_LLM_FAILED_IOCS: list[str] = []
 SIYUBO_LLM_REJECTED_SUMMARIES: list[str] = []
 AI_LLM_REJECTED_SUMMARIES: list[str] = []
-LLM_FAILED_IOCS: list[str] = []
 WD_SNAPSHOT_TOPIC_SUMMARY_CACHE: dict[str, str] = {}
 THREAD_LOCAL = local()
 
@@ -1726,7 +1748,7 @@ def resolve_wd_snapshot_topic(ioc: str, wd_info: WdInfo) -> str:
         return title
     topic, error = query_wd_snapshot_llm_topic(ioc, wd_info.snapshot_content)
     if error:
-        LLM_FAILED_IOCS.append(f"{ioc} | wd 快照主题大模型总结失败：{error}")
+        WD_LLM_FAILED_IOCS.append(f"{ioc} | wd 快照主题大模型总结失败：{error}")
     return topic
 
 
@@ -1740,6 +1762,7 @@ def finalize_decision(decision: RowDecision) -> RowDecision:
     elif decision.solution in {
         "存在黑样本关联",
         "存在关联报告关联",
+        "atateam证据链",
         "src是wd且有快照",
         "siyubo证据链",
         "智能体证据链",
@@ -1816,6 +1839,25 @@ def extract_siyubo_evidence_details(xmon_info: XmonInfo) -> list[str]:
     return list(dict.fromkeys(details))
 
 
+def extract_atateam_evidence_ext(xmon_info: XmonInfo) -> dict[str, Any]:
+    raw = xmon_info.raw if isinstance(xmon_info.raw, dict) else {}
+    child_rows = raw.get("__tagmon_children")
+    if not isinstance(child_rows, list):
+        return {}
+    for child in child_rows:
+        if not isinstance(child, dict):
+            continue
+        exts = child.get("exts") if isinstance(child.get("exts"), dict) else {}
+        src = normalize_cell(first_not_empty(child.get("src"), exts.get("src", "")))
+        if src.lower() != "apt.atateam":
+            continue
+        raw_data = exts.get("_raw") if isinstance(exts.get("_raw"), dict) else {}
+        ext = raw_data.get("ext") if isinstance(raw_data.get("ext"), dict) else {}
+        if ext:
+            return ext
+    return {}
+
+
 def strip_llm_summary_text(value: Any) -> str:
     text = normalize_cell(value)
     if not text:
@@ -1830,6 +1872,15 @@ def normalize_siyubo_llm_summary_with_reason(summary: str) -> tuple[str, str]:
     if not text:
         return "", "大模型返回空"
     if any(term in text for term in SIYUBO_NO_RESULT_TERMS) and not any(term in text for term in SIYUBO_HIT_TERMS):
+        return "", "大模型判定无法形成恶意或可疑依据"
+    return text, ""
+
+
+def normalize_atateam_llm_summary_with_reason(summary: str) -> tuple[str, str]:
+    text = strip_llm_summary_text(summary)
+    if not text:
+        return "", "大模型返回空"
+    if any(term in text for term in ATATEAM_NO_RESULT_TERMS):
         return "", "大模型判定无法形成恶意或可疑依据"
     return text, ""
 
@@ -1980,7 +2031,7 @@ def query_siyubo_llm_summaries(evidence_map: dict[str, list[str]]) -> dict[str, 
                 if error.startswith("SUMMARY_REJECTED:"):
                     SIYUBO_LLM_REJECTED_SUMMARIES.append(f"{ioc} | {error.removeprefix('SUMMARY_REJECTED:')}")
                 else:
-                    LLM_FAILED_IOCS.append(f"{ioc} | {error}")
+                    SIYUBO_LLM_FAILED_IOCS.append(f"{ioc} | siyubo evidence_chain 大模型总结失败：{error}")
             if summary:
                 result_map[ioc] = summary
             if index % AI_PROGRESS_INTERVAL == 0 or index == len(candidates):
@@ -2007,11 +2058,85 @@ def query_siyubo_llm_summaries(evidence_map: dict[str, list[str]]) -> dict[str, 
                 if error.startswith("SUMMARY_REJECTED:"):
                     SIYUBO_LLM_REJECTED_SUMMARIES.append(f"{ioc} | {error.removeprefix('SUMMARY_REJECTED:')}")
                 else:
-                    LLM_FAILED_IOCS.append(f"{ioc} | {error}")
+                    SIYUBO_LLM_FAILED_IOCS.append(f"{ioc} | siyubo evidence_chain 大模型总结失败：{error}")
             if summary:
                 result_map[ioc] = summary
             if completed % AI_PROGRESS_INTERVAL == 0 or completed == len(candidates):
                 print(f"[+] siyubo evidence_chain 大模型总结进度：{completed}/{len(candidates)}")
+    return result_map
+
+
+def query_atateam_llm_summary_one(ioc: str, ext: dict[str, Any]) -> tuple[str, str, str]:
+    if not LLM_TOKEN:
+        return ioc, "", "missing LLM_TOKEN"
+    if not ext:
+        return ioc, "", ""
+    ext_json = json.dumps(ext, ensure_ascii=False, sort_keys=True)
+    payload = build_llm_chat_payload(
+        "你是安全情报分析助手，只输出最终研判依据，不要解释。",
+        (
+            f"{ATATEAM_EVIDENCE_PROMPT}\n\n"
+            "atateam evidence_chain JSON如下：\n"
+            f"- {ext_json[:LLM_EVIDENCE_MAX_INPUT_CHARS]}"
+        ),
+    )
+    summary, error = query_llm_chat_summary(payload)
+    normalized_summary, reject_reason = normalize_atateam_llm_summary_with_reason(summary)
+    if reject_reason and not error:
+        raw_summary = normalize_cell(summary)
+        return ioc, "", f"SUMMARY_REJECTED:{reject_reason}：{raw_summary} | atateam证据链：{ext_json}"
+    return ioc, normalized_summary, error
+
+
+def query_atateam_llm_summaries(evidence_map: dict[str, dict[str, Any]]) -> dict[str, str]:
+    candidates = {ioc: ext for ioc, ext in evidence_map.items() if ext}
+    if not candidates:
+        return {}
+    if not LLM_TOKEN:
+        print("[!] 未配置 LLM_TOKEN，跳过 atateam evidence_chain 大模型总结，继续后续规则。")
+        return {}
+
+    print(f"[+] atateam evidence_chain 大模型总结待处理：{len(candidates)} 条，并发数 {min(LLM_WORKERS, len(candidates))}")
+    result_map: dict[str, str] = {}
+    if LLM_WORKERS <= 1 or len(candidates) == 1:
+        for index, (ioc, ext) in enumerate(candidates.items(), 1):
+            _, summary, error = query_atateam_llm_summary_one(ioc, ext)
+            if error:
+                if error.startswith("SUMMARY_REJECTED:"):
+                    ATATEAM_LLM_REJECTED_SUMMARIES.append(f"{ioc} | {error.removeprefix('SUMMARY_REJECTED:')}")
+                else:
+                    ATATEAM_LLM_FAILED_IOCS.append(f"{ioc} | atateam evidence_chain 大模型总结失败：{error}")
+            if summary:
+                result_map[ioc] = summary
+            if index % AI_PROGRESS_INTERVAL == 0 or index == len(candidates):
+                print(f"[+] atateam evidence_chain 大模型总结进度：{index}/{len(candidates)}")
+            time.sleep(SLEEP_SECONDS)
+        return result_map
+
+    worker_count = min(LLM_WORKERS, len(candidates))
+    completed = 0
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(query_atateam_llm_summary_one, ioc, ext): ioc
+            for ioc, ext in candidates.items()
+        }
+        for future in as_completed(future_map):
+            ioc = future_map[future]
+            completed += 1
+            try:
+                _, summary, error = future.result()
+            except Exception as exc:
+                summary = ""
+                error = str(exc)
+            if error:
+                if error.startswith("SUMMARY_REJECTED:"):
+                    ATATEAM_LLM_REJECTED_SUMMARIES.append(f"{ioc} | {error.removeprefix('SUMMARY_REJECTED:')}")
+                else:
+                    ATATEAM_LLM_FAILED_IOCS.append(f"{ioc} | atateam evidence_chain 大模型总结失败：{error}")
+            if summary:
+                result_map[ioc] = summary
+            if completed % AI_PROGRESS_INTERVAL == 0 or completed == len(candidates):
+                print(f"[+] atateam evidence_chain 大模型总结进度：{completed}/{len(candidates)}")
     return result_map
 
 
@@ -2225,6 +2350,7 @@ def decide_row(
     wfy_info: dict[str, Any],
     wd_info: WdInfo,
     ai_info: AiInfo | None = None,
+    atateam_evidence_summary: str = "",
     siyubo_evidence_summary: str = "",
     sc_malicious: bool = False,
 ) -> RowDecision:
@@ -2289,16 +2415,15 @@ def decide_row(
         decision.hit_rule = "存在关联报告关联"
         return finalize_decision(decision)
 
-    if decision.owner == "wd" and wd_snapshot:
-        rule_description = wd_snapshot_rule_description(extract_xmon_description(xmon_info))
-        if rule_description:
-            topic = resolve_wd_snapshot_topic(decision.ioc, wd_info)
+    if decision.owner == "atateam":
+        evidence_summary = normalize_cell(atateam_evidence_summary)
+        if evidence_summary:
             decision.k01_result = "有效"
-            decision.info_add = format_wd_snapshot_info_add(rule_description, topic)
+            decision.info_add = evidence_summary
             decision.solvable = "能"
-            decision.solution = "src是wd且有快照"
-            decision.rule_hit = "wd_snapshot"
-            decision.hit_rule = "src是wd且有快照"
+            decision.solution = "atateam证据链"
+            decision.rule_hit = "atateam_evidence_chain"
+            decision.hit_rule = "atateam证据链"
             return finalize_decision(decision)
 
     if decision.owner == "siyubo":
@@ -2310,6 +2435,18 @@ def decide_row(
             decision.solution = "siyubo证据链"
             decision.rule_hit = "siyubo_evidence_chain"
             decision.hit_rule = "siyubo证据链"
+            return finalize_decision(decision)
+
+    if decision.owner == "wd" and wd_snapshot:
+        rule_description = wd_snapshot_rule_description(extract_xmon_description(xmon_info))
+        if rule_description:
+            topic = resolve_wd_snapshot_topic(decision.ioc, wd_info)
+            decision.k01_result = "有效"
+            decision.info_add = format_wd_snapshot_info_add(rule_description, topic)
+            decision.solvable = "能"
+            decision.solution = "src是wd且有快照"
+            decision.rule_hit = "wd_snapshot"
+            decision.hit_rule = "src是wd且有快照"
             return finalize_decision(decision)
 
     if ai_info and ai_info.summary:
@@ -2419,6 +2556,8 @@ def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str,
 
     black_hash_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "存在黑样本关联")
     report_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "存在关联报告关联")
+    atateam_evidence_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "atateam证据链")
+    siyubo_evidence_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "siyubo证据链")
     wd_snapshot_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "src是wd且有快照")
     ai_evidence_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "智能体证据链")
 
@@ -2448,6 +2587,8 @@ def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str,
         f"wfy黑{wfy_black_count}条，非黑{wfy_non_black_count}条",
         f"hash黑样本命中{black_hash_count}",
         f"report_links命中{report_count}",
+        f"atateam证据链{atateam_evidence_count}",
+        f"siyubo证据链{siyubo_evidence_count}",
         f"wd存在快照{wd_snapshot_count}",
         f"智能体证据链{ai_evidence_count}",
         f"还剩余{remaining_count}条ioc",
@@ -2541,7 +2682,10 @@ def print_query_failures() -> None:
     print_failure_summary("wfy 查询失败 IOC", WFY_FAILED_QUERIES)
     print_failure_summary("sc 查询失败 IOC", SC_FAILED_IOCS)
     print_failure_summary("wd 查询异常 IOC", WD_FAILED_IOCS)
-    print_failure_summary("siyubo evidence_chain 大模型总结异常 IOC", LLM_FAILED_IOCS)
+    print_failure_summary("wd 快照主题大模型总结异常 IOC", WD_LLM_FAILED_IOCS)
+    print_failure_summary("atateam evidence_chain 大模型总结异常 IOC", ATATEAM_LLM_FAILED_IOCS)
+    print_failure_summary("atateam evidence_chain 大模型总结无效 IOC", ATATEAM_LLM_REJECTED_SUMMARIES, max_items=50)
+    print_failure_summary("siyubo evidence_chain 大模型总结异常 IOC", SIYUBO_LLM_FAILED_IOCS)
     print_failure_summary("siyubo evidence_chain 大模型总结无效 IOC", SIYUBO_LLM_REJECTED_SUMMARIES, max_items=50)
     print_failure_summary("智能体证据链查询异常 IOC", AI_FAILED_IOCS, max_items=None)
     print_failure_summary("智能体证据链大模型总结不合规 IOC", AI_LLM_REJECTED_SUMMARIES, max_items=50)
@@ -2590,7 +2734,10 @@ def collect_failed_iocs_for_rerun(xmon_map: dict[str, XmonInfo]) -> list[str]:
         WFY_FAILED_QUERIES,
         SC_FAILED_IOCS,
         WD_FAILED_IOCS,
-        LLM_FAILED_IOCS,
+        WD_LLM_FAILED_IOCS,
+        ATATEAM_LLM_FAILED_IOCS,
+        ATATEAM_LLM_REJECTED_SUMMARIES,
+        SIYUBO_LLM_FAILED_IOCS,
         SIYUBO_LLM_REJECTED_SUMMARIES,
         AI_FAILED_IOCS,
         AI_LLM_REJECTED_SUMMARIES,
@@ -2614,7 +2761,10 @@ def clear_failed_records_for_iocs(iocs: set[str], xmon_map: dict[str, XmonInfo])
         WFY_FAILED_QUERIES,
         SC_FAILED_IOCS,
         WD_FAILED_IOCS,
-        LLM_FAILED_IOCS,
+        WD_LLM_FAILED_IOCS,
+        ATATEAM_LLM_FAILED_IOCS,
+        ATATEAM_LLM_REJECTED_SUMMARIES,
+        SIYUBO_LLM_FAILED_IOCS,
         SIYUBO_LLM_REJECTED_SUMMARIES,
         AI_FAILED_IOCS,
         AI_LLM_REJECTED_SUMMARIES,
@@ -2637,6 +2787,7 @@ def retry_failed_iocs_from_start(
     wfy_map: dict[str, dict[str, Any]],
     sc_map: dict[str, bool],
     wd_map: dict[str, WdInfo],
+    atateam_summary_map: dict[str, str],
     siyubo_summary_map: dict[str, str],
     ai_map: dict[str, AiInfo],
 ) -> None:
@@ -2675,6 +2826,23 @@ def retry_failed_iocs_from_start(
         if wd_candidate_iocs:
             wd_map.update(query_wd(session, wd_candidate_iocs))
 
+        retry_atateam_evidence_ext_map: dict[str, dict[str, Any]] = {}
+        for ioc in retry_black_iocs:
+            xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
+            wfy_info = wfy_map.get(ioc, {})
+            wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
+            owner = classify_owner(xmon_info, wfy_info, wd_info, sc_map.get(ioc, False))
+            if owner != "atateam":
+                continue
+            if has_black_hash_evidence(xmon_info, hash_map):
+                continue
+            if pick_first_report(xmon_info.report_links):
+                continue
+            ext = extract_atateam_evidence_ext(xmon_info)
+            if ext:
+                retry_atateam_evidence_ext_map[ioc] = ext
+        atateam_summary_map.update(query_atateam_llm_summaries(retry_atateam_evidence_ext_map))
+
         retry_siyubo_evidence_details_map: dict[str, list[str]] = {}
         for ioc in retry_black_iocs:
             xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
@@ -2682,8 +2850,6 @@ def retry_failed_iocs_from_start(
             wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
             owner = classify_owner(xmon_info, wfy_info, wd_info, sc_map.get(ioc, False))
             if owner != "siyubo":
-                continue
-            if is_wd_snapshot_rule_hit(xmon_info, wd_info):
                 continue
             if has_black_hash_evidence(xmon_info, hash_map):
                 continue
@@ -2708,6 +2874,8 @@ def retry_failed_iocs_from_start(
                 continue
             owner = classify_owner(xmon_info, wfy_info, wd_info, sc_map.get(ioc, False))
             if owner == "wd" and is_wd_snapshot_rule_hit(xmon_info, wd_info):
+                continue
+            if atateam_summary_map.get(ioc):
                 continue
             if siyubo_summary_map.get(ioc):
                 continue
@@ -2836,6 +3004,26 @@ def main() -> None:
     wd_map = query_wd(session, wd_candidate_iocs) if wd_candidate_iocs else {}
     finish_stage("查询 wd", stage_time)
 
+    stage_time = start_stage("总结 atateam evidence_chain")
+    atateam_evidence_ext_map: dict[str, dict[str, Any]] = {}
+    for ioc in black_iocs:
+        xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
+        wfy_info = wfy_map.get(ioc, {})
+        wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
+        owner = classify_owner(xmon_info, wfy_info, wd_info, sc_map.get(ioc, False))
+        if owner != "atateam":
+            continue
+        if has_black_hash_evidence(xmon_info, hash_map):
+            continue
+        if pick_first_report(xmon_info.report_links):
+            continue
+        ext = extract_atateam_evidence_ext(xmon_info)
+        if ext:
+            atateam_evidence_ext_map[ioc] = ext
+    atateam_summary_map = query_atateam_llm_summaries(atateam_evidence_ext_map)
+    print(f"[+] atateam evidence_chain 大模型有效总结：{len(atateam_summary_map)} 条")
+    finish_stage("总结 atateam evidence_chain", stage_time)
+
     stage_time = start_stage("总结 siyubo evidence_chain")
     siyubo_evidence_details_map: dict[str, list[str]] = {}
     for ioc in black_iocs:
@@ -2844,8 +3032,6 @@ def main() -> None:
         wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
         owner = classify_owner(xmon_info, wfy_info, wd_info, sc_map.get(ioc, False))
         if owner != "siyubo":
-            continue
-        if is_wd_snapshot_rule_hit(xmon_info, wd_info):
             continue
         if has_black_hash_evidence(xmon_info, hash_map):
             continue
@@ -2874,6 +3060,8 @@ def main() -> None:
         owner = classify_owner(xmon_info, wfy_info, wd_info, sc_map.get(ioc, False))
         if owner == "wd" and is_wd_snapshot_rule_hit(xmon_info, wd_info):
             continue
+        if atateam_summary_map.get(ioc):
+            continue
         if siyubo_summary_map.get(ioc):
             continue
         ai_candidate_iocs.append(ioc)
@@ -2886,6 +3074,7 @@ def main() -> None:
         wfy_map,
         sc_map,
         wd_map,
+        atateam_summary_map,
         siyubo_summary_map,
         ai_map,
     )
@@ -2899,6 +3088,7 @@ def main() -> None:
         wfy_info = wfy_map.get(ioc, {})
         wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
         ai_info = ai_map.get(ioc, AiInfo(ioc=ioc))
+        atateam_evidence_summary = atateam_summary_map.get(ioc, "")
         siyubo_evidence_summary = siyubo_summary_map.get(ioc, "")
         sc_malicious = sc_map.get(ioc, False)
         decision = decide_row(
@@ -2908,6 +3098,7 @@ def main() -> None:
             wfy_info,
             wd_info,
             ai_info,
+            atateam_evidence_summary,
             siyubo_evidence_summary,
             sc_malicious,
         )
