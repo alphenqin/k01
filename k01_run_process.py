@@ -96,7 +96,7 @@ AI_QUICK_ANALYSIS_HEADERS = {
 }
 AI_KEY_EVIDENCE_DROP_TERMS = ("外部威胁情报", "威胁情报状态", "外部")
 AI_EVIDENCE_PROMPT = (
-    "将以下内容汇总为一句完整的情报研判依据，长度50字左右，必须以句号结尾，不要输出半句话或泛化短语。"
+    "将以下内容汇总为一句情报研判依据，长度50字左右。"
     "若信息不足以形成依据，请返回空字符串。不要输出安全声明、伦理声明、拒答说明或无关建议。"
 )
 
@@ -104,8 +104,7 @@ AI_EVIDENCE_PROMPT = (
 LLM_API_URL = os.getenv("K01_LLM_API_URL", "https://api.360.cn/v1/chat/completions")
 LLM_MODEL = os.getenv("K01_LLM_MODEL", "deepseek/deepseek-v4-flash-internal")
 LLM_TOKEN = os.getenv("K01_LLM_TOKEN", "fk3631605771.Jh8vxBCKY9nGWVCyrAQIRD9eNC5vVVRFfef19530")  # 如需使用大模型能力，在这里或环境变量填写 token。
-LLM_SUMMARY_MAX_TOKENS = 1500  # 该接口会按 max_tokens 裁剪 messages，摘要场景不要设得过低。
-LLM_EVIDENCE_MAX_INPUT_CHARS = 1000  # 主动限制证据输入长度，避免服务端不可控截断。
+LLM_SUMMARY_MAX_TOKENS = 2000  # 该接口会按 max_tokens 裁剪 messages，摘要场景不要设得过低。
 
 # ===== siyubo evidence_chain 总结配置 =====
 SIYUBO_NO_RESULT = "信息有限，无对应研判结果"
@@ -144,9 +143,6 @@ ATATEAM_EVIDENCE_PROMPT = (
 )
 AI_NO_RESULT_TERMS = ("无法研判", "无法判断", "不能研判", "信息有限", "无对应研判结果", "信息不足", "空字符串")
 AI_REFUSAL_TERMS = ("无法回答", "不能回答", "有益知识", "法律与道德", "有建设性的话题", "遵守所有相关")
-AI_SUMMARY_MIN_CHARS = 15
-AI_GENERIC_SUMMARIES = {"360标记", "360威胁情报", "高危域名", "恶意域名", "威胁情报"}
-AI_COMPLETE_SUMMARY_ENDINGS = ("。", "！", "？", ".", "!", "?")
 
 # ===== 性能控制配置 =====
 # 这些配置直接改脚本即可，不依赖环境变量。
@@ -1801,20 +1797,12 @@ def summarize_evidence_details(details: list[str], limit: int = 50) -> str:
     return summary[:limit]
 
 
-def format_llm_evidence_bullets(details: list[str], max_chars: int = LLM_EVIDENCE_MAX_INPUT_CHARS) -> str:
+def format_llm_evidence_bullets(details: list[str]) -> str:
     lines: list[str] = []
-    used = 0
     for detail in dict.fromkeys(normalize_cell(item) for item in details):
         if not detail:
             continue
-        line = f"- {detail}"
-        next_used = used + len(line) + (1 if lines else 0)
-        if lines and next_used > max_chars:
-            break
-        if not lines and len(line) > max_chars:
-            line = line[:max_chars]
-        lines.append(line)
-        used += len(line) + (1 if lines else 0)
+        lines.append(f"- {detail}")
     return "\n".join(lines)
 
 
@@ -1935,10 +1923,6 @@ def normalize_ai_llm_summary_with_reason(summary: str) -> tuple[str, str]:
         return "", "包含无法形成依据相关词"
     if any(term in text for term in AI_REFUSAL_TERMS):
         return "", "大模型返回拒答套话"
-    if text in AI_GENERIC_SUMMARIES or len(text) < AI_SUMMARY_MIN_CHARS:
-        return "", "泛化短语或长度过短"
-    if not text.endswith(AI_COMPLETE_SUMMARY_ENDINGS):
-        return "", "未以完整句结束"
     return text, ""
 
 
@@ -2119,7 +2103,7 @@ def query_atateam_llm_summary_one(ioc: str, ext: dict[str, Any]) -> tuple[str, s
         (
             f"{ATATEAM_EVIDENCE_PROMPT}\n\n"
             "atateam evidence_chain JSON如下：\n"
-            f"- {ext_json[:LLM_EVIDENCE_MAX_INPUT_CHARS]}"
+            f"- {ext_json}"
         ),
     )
     summary, error = query_llm_chat_summary(payload)
