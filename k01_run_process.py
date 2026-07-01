@@ -1686,11 +1686,13 @@ def map_k01_status(xmon_status: Any) -> str:
 
 REPORT_DEFAULT_TIMESTAMP = 0
 REPORT_URL_RE = re.compile(r"https?://[^\s\"'<>，；、（）()\\\\]+")
+REPORT_URL_BLACKLIST = {"https://dbl.oisd.nl/"}
 REPORT_DATETIME_PATTERNS = (
     re.compile(r"(?P<date>\d{4}[-/]\d{1,2}[-/]\d{1,2})(?:[T_\s]+(?P<time>\d{1,2}[:：]\d{1,2}(?:[:：]\d{1,2})?))?"),
     re.compile(r"(?P<date>\d{8})[_-]?(?P<time>\d{6})"),
 )
 REPORT_HOST_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$", re.IGNORECASE)
+NORMALIZED_REPORT_URL_BLACKLIST = {url.rstrip("/") for url in REPORT_URL_BLACKLIST}
 
 
 def clean_report_url(url: str) -> str:
@@ -1796,6 +1798,10 @@ def normalize_report_url(url: str) -> str:
     return clean_report_url(url)
 
 
+def is_blacklisted_report_url(url: str) -> bool:
+    return normalize_report_url(url).rstrip("/") in NORMALIZED_REPORT_URL_BLACKLIST
+
+
 def pick_first_report(report_links: Any) -> str:
     if isinstance(report_links, list) and all(isinstance(item, dict) and "url" in item for item in report_links):
         candidates = report_links
@@ -1807,6 +1813,8 @@ def pick_first_report(report_links: Any) -> str:
     for candidate in candidates:
         url = normalize_report_url(candidate.get("url", ""))
         if not is_valid_report_url(url):
+            continue
+        if is_blacklisted_report_url(url):
             continue
         timestamp = safe_int(candidate.get("timestamp"), REPORT_DEFAULT_TIMESTAMP)
         if timestamp > best_timestamp:
