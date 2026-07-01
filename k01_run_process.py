@@ -796,7 +796,7 @@ def build_xmon_info_from_rows(requested_ioc: str, rows: list[dict[str, Any]], ch
     return normalize_xmon_row(requested_ioc, enriched_row)
 
 
-def query_xmon_iocs(session: Session, ioc_list: list[str]) -> dict[str, XmonInfo]:
+def query_xmon_iocs(ioc_list: list[str]) -> dict[str, XmonInfo]:
     result_map: dict[str, XmonInfo] = {}
     query_iocs = list(dict.fromkeys(ioc for ioc in ioc_list if ioc))
     if not query_iocs:
@@ -897,10 +897,10 @@ def extract_hashes_from_xmon_info(xmon_info: XmonInfo) -> list[str]:
     return list(dict.fromkeys(hashes))
 
 
-def query_hash_batch(session: Session, hash_list: list[str]) -> Any:
+def query_hash_batch(hash_list: list[str]) -> Any:
     payload = {"param": ",".join(hash_list), "field": 0}
     try:
-        resp = session.post(
+        resp = get_thread_session().post(
             HASH_API_URL,
             headers=make_ti_headers(),
             data=json_utf8_body(payload),
@@ -915,7 +915,7 @@ def query_hash_batch(session: Session, hash_list: list[str]) -> Any:
 
 
 def query_hash_batch_worker(hash_batch: list[str]) -> tuple[list[str], dict[str, HashInfo]]:
-    response_json = query_hash_batch(get_thread_session(), hash_batch)
+    response_json = query_hash_batch(hash_batch)
     parsed = parse_hash_result(hash_batch, response_json)
     return hash_batch, parsed
 
@@ -967,7 +967,7 @@ def parse_hash_result(hash_list: list[str], response_json: Any) -> dict[str, Has
     return hash_map
 
 
-def query_hashes(session: Session, hash_list: list[str]) -> dict[str, HashInfo]:
+def query_hashes(hash_list: list[str]) -> dict[str, HashInfo]:
     unique_hashes = list(dict.fromkeys(h for h in hash_list if h))
     all_hash_map: dict[str, HashInfo] = {}
     if not unique_hashes:
@@ -981,7 +981,7 @@ def query_hashes(session: Session, hash_list: list[str]) -> dict[str, HashInfo]:
     if HASH_WORKERS <= 1 or len(batches) == 1:
         completed = 0
         for hash_batch in batches:
-            response_json = query_hash_batch(session, hash_batch)
+            response_json = query_hash_batch(hash_batch)
             parsed = parse_hash_result(hash_batch, response_json)
             all_hash_map.update(parsed)
             completed += len(hash_batch)
@@ -1040,7 +1040,7 @@ def query_wfy_batch(batch: list[str]) -> tuple[list[str], dict[str, dict[str, An
     return batch, {ioc: {"query_error": last_error, "judge": ""} for ioc in batch}, last_error
 
 
-def query_wfy(session: Session, ioc_list: list[str]) -> dict[str, dict[str, Any]]:
+def query_wfy(ioc_list: list[str]) -> dict[str, dict[str, Any]]:
     result_map: dict[str, dict[str, Any]] = {}
     query_iocs = list(dict.fromkeys(ioc for ioc in ioc_list if ioc))
     if not query_iocs:
@@ -1299,7 +1299,6 @@ def sc_category_for_ioc(ioc: str) -> str:
 
 
 def query_custom_tags_batch(
-    session: Session,
     batch: list[str],
     category: str | None = None,
 ) -> tuple[list[str], dict[str, dict[str, Any]], str]:
@@ -1315,7 +1314,7 @@ def query_custom_tags_batch(
         }
     }
     try:
-        resp = session.post(
+        resp = get_thread_session().post(
             TAGS_API_URL,
             headers=make_ti_headers(),
             data=json_utf8_body(payload),
@@ -1329,7 +1328,7 @@ def query_custom_tags_batch(
 
 
 def query_custom_tags_batch_worker(batch: list[str]) -> tuple[list[str], dict[str, dict[str, Any]], str]:
-    return query_custom_tags_batch(get_thread_session(), batch)
+    return query_custom_tags_batch(batch)
 
 
 def parse_sc_response(batch: list[str], data: Any) -> dict[str, dict[str, Any]]:
@@ -1378,7 +1377,7 @@ def sc_is_malicious(response_json: dict[str, Any]) -> bool:
     return level is not None and level > 30
 
 
-def query_sc(session: Session, ioc_list: list[str]) -> dict[str, bool]:
+def query_sc(ioc_list: list[str]) -> dict[str, bool]:
     query_iocs = list(dict.fromkeys(ioc for ioc in ioc_list if ioc))
     sc_map: dict[str, bool] = {}
     if not query_iocs:
@@ -1392,7 +1391,7 @@ def query_sc(session: Session, ioc_list: list[str]) -> dict[str, bool]:
     if SC_WORKERS <= 1 or len(batches) == 1:
         completed = 0
         for batch in batches:
-            _, parsed, error = query_custom_tags_batch(session, batch)
+            _, parsed, error = query_custom_tags_batch(batch)
             if error:
                 for ioc in batch:
                     SC_FAILED_IOCS.append(f"{ioc} | {error}")
@@ -1533,11 +1532,11 @@ def wd_snapshot_row_content(row: dict[str, Any]) -> str:
     return text[:4000]
 
 
-def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, str, str, str]:
+def query_wd_history_snapshot(ioc: str) -> tuple[bool, str, str, str, str]:
     headers = {"X-Authtoken": WD_HISTORY_TOKEN}
     params = {"query": ioc, "time_start": WD_HISTORY_START}
     try:
-        resp = session.get(
+        resp = get_thread_session().get(
             WD_HISTORY_API_URL,
             params=params,
             headers=headers,
@@ -1565,12 +1564,11 @@ def query_wd_history_snapshot(session: Session, ioc: str) -> tuple[bool, str, st
 
 
 def query_wd_history_one(ioc: str) -> tuple[str, bool, str, str, str, str]:
-    session = get_thread_session()
-    has_snapshot, topic, title, content, error = query_wd_history_snapshot(session, ioc)
+    has_snapshot, topic, title, content, error = query_wd_history_snapshot(ioc)
     return ioc, has_snapshot, topic, title, content, error
 
 
-def query_wd(session: Session, ioc_list: list[str]) -> dict[str, WdInfo]:
+def query_wd(ioc_list: list[str]) -> dict[str, WdInfo]:
     unique_iocs = list(dict.fromkeys(ioc for ioc in ioc_list if ioc))
     result_map: dict[str, WdInfo] = {}
     if not unique_iocs:
@@ -2257,7 +2255,7 @@ def query_siyubo_llm_summary_one(ioc: str, details: list[str]) -> tuple[str, str
     return ioc, normalized_summary, error
 
 
-def query_siyubo_llm_summaries(evidence_map: dict[str, list[str]]) -> dict[str, str]:
+def query_siyubo_llm_summaries(evidence_map: dict[str, list[str]], max_workers: int | None = None) -> dict[str, str]:
     candidates = {ioc: details for ioc, details in evidence_map.items() if details}
     if not candidates:
         return {}
@@ -2265,9 +2263,10 @@ def query_siyubo_llm_summaries(evidence_map: dict[str, list[str]]) -> dict[str, 
         print("[!] 未配置 LLM_TOKEN，跳过 siyubo evidence_chain 大模型总结，继续后续智能体证据链规则。")
         return {}
 
-    print(f"[+] siyubo evidence_chain 大模型总结待处理：{len(candidates)} 条，并发数 {min(LLM_WORKERS, len(candidates))}")
+    configured_workers = LLM_WORKERS if max_workers is None else max(1, max_workers)
+    print(f"[+] siyubo evidence_chain 大模型总结待处理：{len(candidates)} 条，并发数 {min(configured_workers, len(candidates))}")
     result_map: dict[str, str] = {}
-    if LLM_WORKERS <= 1 or len(candidates) == 1:
+    if configured_workers <= 1 or len(candidates) == 1:
         for index, (ioc, details) in enumerate(candidates.items(), 1):
             _, summary, error = query_siyubo_llm_summary_one(ioc, details)
             if error:
@@ -2282,7 +2281,7 @@ def query_siyubo_llm_summaries(evidence_map: dict[str, list[str]]) -> dict[str, 
             time.sleep(SLEEP_SECONDS)
         return result_map
 
-    worker_count = min(LLM_WORKERS, len(candidates))
+    worker_count = min(configured_workers, len(candidates))
     completed = 0
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {
@@ -2331,7 +2330,7 @@ def query_atateam_llm_summary_one(ioc: str, ext: dict[str, Any]) -> tuple[str, s
     return ioc, normalized_summary, error
 
 
-def query_atateam_llm_summaries(evidence_map: dict[str, dict[str, Any]]) -> dict[str, str]:
+def query_atateam_llm_summaries(evidence_map: dict[str, dict[str, Any]], max_workers: int | None = None) -> dict[str, str]:
     candidates = {ioc: ext for ioc, ext in evidence_map.items() if ext}
     if not candidates:
         return {}
@@ -2339,9 +2338,10 @@ def query_atateam_llm_summaries(evidence_map: dict[str, dict[str, Any]]) -> dict
         print("[!] 未配置 LLM_TOKEN，跳过 atateam evidence_chain 大模型总结，继续后续规则。")
         return {}
 
-    print(f"[+] atateam evidence_chain 大模型总结待处理：{len(candidates)} 条，并发数 {min(LLM_WORKERS, len(candidates))}")
+    configured_workers = LLM_WORKERS if max_workers is None else max(1, max_workers)
+    print(f"[+] atateam evidence_chain 大模型总结待处理：{len(candidates)} 条，并发数 {min(configured_workers, len(candidates))}")
     result_map: dict[str, str] = {}
-    if LLM_WORKERS <= 1 or len(candidates) == 1:
+    if configured_workers <= 1 or len(candidates) == 1:
         for index, (ioc, ext) in enumerate(candidates.items(), 1):
             _, summary, error = query_atateam_llm_summary_one(ioc, ext)
             if error:
@@ -2356,7 +2356,7 @@ def query_atateam_llm_summaries(evidence_map: dict[str, dict[str, Any]]) -> dict
             time.sleep(SLEEP_SECONDS)
         return result_map
 
-    worker_count = min(LLM_WORKERS, len(candidates))
+    worker_count = min(configured_workers, len(candidates))
     completed = 0
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {
@@ -3037,7 +3037,6 @@ def clear_failed_records_for_iocs(iocs: set[str], xmon_map: dict[str, XmonInfo])
 
 
 def retry_failed_iocs_from_start(
-    session: Session,
     all_iocs: list[str],
     xmon_map: dict[str, XmonInfo],
     hash_map: dict[str, HashInfo],
@@ -3061,10 +3060,10 @@ def retry_failed_iocs_from_start(
         clear_failed_records_for_iocs(retry_ioc_set, xmon_map)
         print(f"\n[+] 异常 IOC 全流程重跑第 {round_index}/{FAILED_IOC_RERUNS} 轮：{len(retry_iocs)} 条")
 
-        wfy_map.update(query_wfy(session, retry_iocs))
+        wfy_map.update(query_wfy(retry_iocs))
         retry_black_iocs = [ioc for ioc in retry_iocs if wfy_is_black(wfy_map.get(ioc, {}))]
         if retry_black_iocs:
-            retry_xmon_map = query_xmon_iocs(session, retry_black_iocs)
+            retry_xmon_map = query_xmon_iocs(retry_black_iocs)
             xmon_map.update(retry_xmon_map)
 
             retry_hashes: list[str] = []
@@ -3072,9 +3071,9 @@ def retry_failed_iocs_from_start(
                 retry_hashes.extend(extract_hashes_from_xmon_info(xmon_map.get(ioc, empty_xmon_info(ioc))))
             retry_unique_hashes = list(dict.fromkeys(hash_value for hash_value in retry_hashes if hash_value))
             if retry_unique_hashes:
-                hash_map.update(query_hashes(session, retry_unique_hashes))
+                hash_map.update(query_hashes(retry_unique_hashes))
 
-            sc_map.update(query_sc(session, retry_black_iocs))
+            sc_map.update(query_sc(retry_black_iocs))
 
         wd_candidate_iocs = [
             ioc
@@ -3082,7 +3081,7 @@ def retry_failed_iocs_from_start(
             if not {"atateam", "siyubo"}.intersection(xmon_owner_candidates(xmon_map.get(ioc, empty_xmon_info(ioc))))
         ]
         if wd_candidate_iocs:
-            wd_map.update(query_wd(session, wd_candidate_iocs))
+            wd_map.update(query_wd(wd_candidate_iocs))
 
         retry_atateam_evidence_ext_map: dict[str, dict[str, Any]] = {}
         for ioc in retry_black_iocs:
@@ -3213,58 +3212,71 @@ def finish_stage(name: str, start_time: float) -> None:
     print(f"[+] 完成：{name}，耗时 {elapsed:.2f} 秒（{elapsed / 60:.2f} 分钟）")
 
 
-def main() -> None:
-    start_time = time.time()
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    remove_old_outputs()
-    stage_time = start_stage("读取输入")
-    df = read_input()
-    ioc_list = list(dict.fromkeys(x for x in df["ioc"].tolist() if x))
-    print(f"[+] 读取输入：{len(df)} 行，唯一 IOC：{len(ioc_list)}")
-    finish_stage("读取输入", stage_time)
+def run_stage(name: str, func: Any) -> Any:
+    stage_time = start_stage(name)
+    try:
+        return func()
+    finally:
+        finish_stage(name, stage_time)
 
-    session = make_session()
 
-    stage_time = start_stage("查询 wfy")
-    wfy_map = query_wfy(session, ioc_list)
-    black_iocs = [ioc for ioc in ioc_list if wfy_is_black(wfy_map.get(ioc, {}))]
-    print(f"[+] wfy black IOC：{len(black_iocs)} 条")
-    finish_stage("查询 wfy", stage_time)
+def run_parallel_stages(stage_funcs: dict[str, Any]) -> dict[str, Any]:
+    if not stage_funcs:
+        return {}
+    names = list(stage_funcs.keys())
+    if len(names) > 1:
+        print(f"[+] 并行执行：{'、'.join(names)}")
+    results: dict[str, Any] = {}
+    first_error: Exception | None = None
+    with ThreadPoolExecutor(max_workers=len(stage_funcs)) as executor:
+        future_map = {executor.submit(run_stage, name, func): name for name, func in stage_funcs.items()}
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                # 接口查询失败已在底层 batch 函数内 try 并记录 FAILED_IOCS，不会到达这里；
+                # 能到达这里的异常是编排逻辑 bug 或数据结构变化，必须暴露，不能静默成空结果。
+                print(f"[!] 阶段「{name}」异常：{exc}")
+                if first_error is None:
+                    first_error = exc
+    if first_error is not None:
+        raise first_error
+    return results
 
-    stage_time = start_stage("查询 xmon 主线索和子线索")
-    xmon_map = query_xmon_iocs(session, black_iocs) if black_iocs else {}
-    finish_stage("查询 xmon 主线索和子线索", stage_time)
 
-    stage_time = start_stage("提取并查询 hash 文件情报")
+def build_hash_map_from_xmon(xmon_map: dict[str, XmonInfo]) -> dict[str, HashInfo]:
     all_hashes: list[str] = []
     for xmon_info in xmon_map.values():
         all_hashes.extend(extract_hashes_from_xmon_info(xmon_info))
     unique_hashes = list(dict.fromkeys(h for h in all_hashes if h))
     print(f"[+] xmon 提取关联 hash：{len(unique_hashes)} 条")
-    hash_map = query_hashes(session, unique_hashes)
+    hash_map = query_hashes(unique_hashes)
     risk_counter = Counter(normalize_cell(info.risk).lower() or "empty" for info in hash_map.values())
     print(f"[+] hash risk 统计：{dict(risk_counter)}")
     hash_hit_count = sum(1 for info in hash_map.values() if normalize_cell(info.risk))
     black_hash_count = sum(1 for info in hash_map.values() if risk_is_black(info.risk))
     print(f"[+] hash 文件情报命中：{hash_hit_count}/{len(unique_hashes)}，黑样本 hash：{black_hash_count}")
-    finish_stage("提取并查询 hash 文件情报", stage_time)
+    return hash_map
 
-    stage_time = start_stage("查询 sc")
-    sc_map = query_sc(session, black_iocs) if black_iocs else {}
-    finish_stage("查询 sc", stage_time)
 
-    stage_time = start_stage("查询 wd")
-    wd_candidate_iocs = [
+def build_wd_candidate_iocs(black_iocs: list[str], xmon_map: dict[str, XmonInfo]) -> list[str]:
+    return [
         ioc
         for ioc in black_iocs
         if not {"atateam", "siyubo"}.intersection(xmon_owner_candidates(xmon_map.get(ioc, empty_xmon_info(ioc))))
     ]
-    print(f"[+] wd 候选 IOC：{len(wd_candidate_iocs)} 条")
-    wd_map = query_wd(session, wd_candidate_iocs) if wd_candidate_iocs else {}
-    finish_stage("查询 wd", stage_time)
 
-    stage_time = start_stage("总结 atateam evidence_chain")
-    atateam_evidence_ext_map: dict[str, dict[str, Any]] = {}
+
+def build_atateam_evidence_ext_map(
+    black_iocs: list[str],
+    xmon_map: dict[str, XmonInfo],
+    hash_map: dict[str, HashInfo],
+    wfy_map: dict[str, dict[str, Any]],
+    sc_map: dict[str, bool],
+    wd_map: dict[str, WdInfo],
+) -> dict[str, dict[str, Any]]:
+    evidence_map: dict[str, dict[str, Any]] = {}
     for ioc in black_iocs:
         xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
         wfy_info = wfy_map.get(ioc, {})
@@ -3278,13 +3290,19 @@ def main() -> None:
             continue
         ext = extract_atateam_evidence_ext(xmon_info)
         if ext:
-            atateam_evidence_ext_map[ioc] = ext
-    atateam_summary_map = query_atateam_llm_summaries(atateam_evidence_ext_map)
-    print(f"[+] atateam evidence_chain 大模型有效总结：{len(atateam_summary_map)} 条")
-    finish_stage("总结 atateam evidence_chain", stage_time)
+            evidence_map[ioc] = ext
+    return evidence_map
 
-    stage_time = start_stage("总结 siyubo evidence_chain")
-    siyubo_evidence_details_map: dict[str, list[str]] = {}
+
+def build_siyubo_evidence_details_map(
+    black_iocs: list[str],
+    xmon_map: dict[str, XmonInfo],
+    hash_map: dict[str, HashInfo],
+    wfy_map: dict[str, dict[str, Any]],
+    sc_map: dict[str, bool],
+    wd_map: dict[str, WdInfo],
+) -> dict[str, list[str]]:
+    evidence_map: dict[str, list[str]] = {}
     for ioc in black_iocs:
         xmon_info = xmon_map.get(ioc, empty_xmon_info(ioc))
         wfy_info = wfy_map.get(ioc, {})
@@ -3298,12 +3316,32 @@ def main() -> None:
             continue
         details = extract_siyubo_evidence_details(xmon_info)
         if details:
-            siyubo_evidence_details_map[ioc] = details
-    siyubo_summary_map = query_siyubo_llm_summaries(siyubo_evidence_details_map)
-    print(f"[+] siyubo evidence_chain 大模型有效总结：{len(siyubo_summary_map)} 条")
-    finish_stage("总结 siyubo evidence_chain", stage_time)
+            evidence_map[ioc] = details
+    return evidence_map
 
-    stage_time = start_stage("查询智能体证据链")
+
+def split_llm_stage_workers(atateam_count: int, siyubo_count: int) -> tuple[int, int]:
+    total = max(1, LLM_WORKERS)
+    if atateam_count <= 0 or siyubo_count <= 0:
+        return total, total
+    # 各自保底 1，剩余按候选数比例分配，保证总和不超过 total
+    remaining = max(0, total - 2)
+    atateam = 1 + round(remaining * atateam_count / (atateam_count + siyubo_count))
+    atateam = min(atateam, atateam_count)
+    siyubo = min(total - atateam, siyubo_count)
+    return atateam, siyubo
+
+
+def build_ai_candidate_iocs(
+    ioc_list: list[str],
+    xmon_map: dict[str, XmonInfo],
+    hash_map: dict[str, HashInfo],
+    wfy_map: dict[str, dict[str, Any]],
+    sc_map: dict[str, bool],
+    wd_map: dict[str, WdInfo],
+    atateam_summary_map: dict[str, str],
+    siyubo_summary_map: dict[str, str],
+) -> list[str]:
     ai_candidate_iocs: list[str] = []
     for ioc in ioc_list:
         if not wfy_is_black(wfy_map.get(ioc, {})):
@@ -3324,13 +3362,92 @@ def main() -> None:
         if siyubo_summary_map.get(ioc):
             continue
         ai_candidate_iocs.append(ioc)
-    stage_time_external = start_stage("查询外部接口证据链")
-    external_ioc_map = query_external_ioc_evidence(ai_candidate_iocs) if ai_candidate_iocs else {}
-    finish_stage("查询外部接口证据链", stage_time_external)
+    return ai_candidate_iocs
 
+
+def main() -> None:
+    start_time = time.time()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    remove_old_outputs()
+    stage_time = start_stage("读取输入")
+    df = read_input()
+    ioc_list = list(dict.fromkeys(x for x in df["ioc"].tolist() if x))
+    print(f"[+] 读取输入：{len(df)} 行，唯一 IOC：{len(ioc_list)}")
+    finish_stage("读取输入", stage_time)
+
+    stage_time = start_stage("查询 wfy")
+    wfy_map = query_wfy(ioc_list)
+    black_iocs = [ioc for ioc in ioc_list if wfy_is_black(wfy_map.get(ioc, {}))]
+    print(f"[+] wfy black IOC：{len(black_iocs)} 条")
+    finish_stage("查询 wfy", stage_time)
+
+    if black_iocs:
+        first_parallel_results = run_parallel_stages(
+            {
+                "查询 xmon 主线索和子线索": lambda: query_xmon_iocs(black_iocs),
+                "查询 sc": lambda: query_sc(black_iocs),
+            }
+        )
+        xmon_map = first_parallel_results["查询 xmon 主线索和子线索"]
+        sc_map = first_parallel_results["查询 sc"]
+    else:
+        xmon_map = {}
+        sc_map = {}
+
+    wd_candidate_iocs = build_wd_candidate_iocs(black_iocs, xmon_map)
+    print(f"[+] wd 候选 IOC：{len(wd_candidate_iocs)} 条")
+    second_stage_funcs: dict[str, Any] = {
+        "提取并查询 hash 文件情报": lambda: build_hash_map_from_xmon(xmon_map),
+    }
+    if wd_candidate_iocs:
+        second_stage_funcs["查询 wd"] = lambda: query_wd(wd_candidate_iocs)
+    second_parallel_results = run_parallel_stages(second_stage_funcs)
+    hash_map = second_parallel_results["提取并查询 hash 文件情报"]
+    wd_map = second_parallel_results.get("查询 wd", {})
+
+    atateam_evidence_ext_map = build_atateam_evidence_ext_map(black_iocs, xmon_map, hash_map, wfy_map, sc_map, wd_map)
+    siyubo_evidence_details_map = build_siyubo_evidence_details_map(black_iocs, xmon_map, hash_map, wfy_map, sc_map, wd_map)
+    atateam_workers, siyubo_workers = split_llm_stage_workers(
+        len(atateam_evidence_ext_map),
+        len(siyubo_evidence_details_map),
+    )
+    llm_stage_funcs: dict[str, Any] = {}
+    if atateam_evidence_ext_map:
+        llm_stage_funcs["总结 atateam evidence_chain"] = lambda: query_atateam_llm_summaries(
+            atateam_evidence_ext_map,
+            max_workers=atateam_workers,
+        )
+    if siyubo_evidence_details_map:
+        llm_stage_funcs["总结 siyubo evidence_chain"] = lambda: query_siyubo_llm_summaries(
+            siyubo_evidence_details_map,
+            max_workers=siyubo_workers,
+        )
+    if len(llm_stage_funcs) > 1 and LLM_WORKERS <= 1:
+        llm_parallel_results = {name: run_stage(name, func) for name, func in llm_stage_funcs.items()}
+    else:
+        llm_parallel_results = run_parallel_stages(llm_stage_funcs)
+    atateam_summary_map = llm_parallel_results.get("总结 atateam evidence_chain", {})
+    siyubo_summary_map = llm_parallel_results.get("总结 siyubo evidence_chain", {})
+    print(f"[+] atateam evidence_chain 大模型有效总结：{len(atateam_summary_map)} 条")
+    print(f"[+] siyubo evidence_chain 大模型有效总结：{len(siyubo_summary_map)} 条")
+
+    ai_candidate_iocs = build_ai_candidate_iocs(
+        ioc_list,
+        xmon_map,
+        hash_map,
+        wfy_map,
+        sc_map,
+        wd_map,
+        atateam_summary_map,
+        siyubo_summary_map,
+    )
+    stage_time = start_stage("查询外部接口证据链")
+    external_ioc_map = query_external_ioc_evidence(ai_candidate_iocs) if ai_candidate_iocs else {}
+    finish_stage("查询外部接口证据链", stage_time)
+
+    stage_time = start_stage("查询智能体证据链")
     ai_map = query_ai_quick_analysis(ai_candidate_iocs) if ai_candidate_iocs else {}
     retry_failed_iocs_from_start(
-        session,
         ioc_list,
         xmon_map,
         hash_map,
