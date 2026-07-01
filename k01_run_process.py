@@ -100,6 +100,20 @@ AI_EVIDENCE_PROMPT = (
     "若信息不足以形成依据，请返回空字符串。不要输出安全声明、伦理声明、拒答说明或无关建议。"
 )
 
+# ===== 外部接口证据链配置 =====
+EXTERNAL_WB_IOC_SEARCH_URL = os.getenv("K01_EXTERNAL_WB_IOC_SEARCH_URL", "http://api.netlab.qihoo.net/external-wb-ioc-search/batch")
+EXTERNAL_QAX_IOC_SEARCH_URL = os.getenv("K01_EXTERNAL_QAX_IOC_SEARCH_URL", "http://api.netlab.qihoo.net/external-q-ioc-search")
+EXTERNAL_IOC_HEADERS = {
+    "Content-Type": "application/json",
+    "X-AuthToken": XMON_TOKEN,
+}
+EXTERNAL_QAX_HEADERS = {
+    "X-AuthToken": XMON_TOKEN,
+}
+EXTERNAL_WB_HIT_RULE = "外部wb接口证据链"
+EXTERNAL_QAX_HIT_RULE = "外部qax接口证据链"
+EXTERNAL_QAX_HAZARD_LEVELS = {"low", "medium", "high", "critical"}
+
 # ===== 大模型公共配置 =====
 LLM_API_URL = os.getenv("K01_LLM_API_URL", "https://api.360.cn/v1/chat/completions")
 LLM_MODEL = os.getenv("K01_LLM_MODEL", "deepseek/deepseek-v4-flash-internal")
@@ -167,6 +181,11 @@ WFY_MAX_BATCH_SIZE = 100  # wfy 接口允许的最大批量；用于防止误改
 WFY_PROGRESS_INTERVAL = 100  # wfy 每处理多少条 IOC 打印一次进度。
 WFY_RETRIES = 4  # wfy 遇到 429 或临时异常时的最大重试次数。
 WFY_RETRY_SLEEP_SECONDS = 2.0  # wfy 重试退避基准秒数；实际等待按 2、4、8... 递增。
+EXTERNAL_WB_WORKERS = 4  # 外部 wb 接口批次查询并发数。
+EXTERNAL_WB_BATCH_SIZE = 100  # 外部 wb 接口每批最多 IOC 数。
+EXTERNAL_WB_MAX_BATCH_SIZE = 100  # 外部 wb 接口允许的最大批量。
+EXTERNAL_QAX_WORKERS = 12  # 外部 qax 接口单 IOC 查询并发数。
+EXTERNAL_PROGRESS_INTERVAL = 100  # 外部接口证据链每处理多少条 IOC 打印一次进度。
 SC_WORKERS = 12  # sc 批次查询并发数。
 SC_BATCH_SIZE = 80  # sc 每批 IOC 数；payload 中 query.value 用英文逗号拼接。
 SC_PROGRESS_INTERVAL = 100  # sc 每处理多少条 IOC 打印一次进度。
@@ -225,6 +244,7 @@ TAGMON_FAILED_LOCK = Lock()
 HASH_FAILED_QUERIES: list[str] = []
 HASH_FAILED_LOCK = Lock()
 WFY_FAILED_QUERIES: list[str] = []
+EXTERNAL_IOC_FAILED_QUERIES: list[str] = []
 SC_FAILED_IOCS: list[str] = []
 WD_FAILED_IOCS: list[str] = []
 AI_FAILED_IOCS: list[str] = []
@@ -294,6 +314,17 @@ class AiInfo:
     key_evidence: list[str] = field(default_factory=list)
     summary: str = ""
     query_error: str = ""
+
+
+@dataclass
+class ExternalIocInfo:
+    ioc: str = ""
+    hit_rule: str = ""
+    query_error: str = ""
+
+    @property
+    def malicious(self) -> bool:
+        return bool(self.hit_rule)
 
 
 @dataclass
@@ -1080,6 +1111,184 @@ def parse_wfy_response(batch: list[str], data: Any) -> dict[str, dict[str, Any]]
     for ioc in batch:
         parsed.setdefault(ioc, {})
     return parsed
+
+
+def external_wb_item_is_malicious(item: dict[str, Any]) -> bool:
+    data = item.get("data")
+    if not isinstance(data, dict):
+        return False
+    contexts = data.get("contexts")
+    if not isinstance(contexts, list):
+        return False
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        severity = normalize_cell(context.get("severity"))
+        if severity and severity != "0":
+            return True
+    return False
+
+
+def parse_external_wb_response(batch: list[str], data: Any) -> dict[str, ExternalIocInfo]:
+    parsed = {ioc: ExternalIocInfo(ioc=ioc) for ioc in batch}
+    results = data.get("results") if isinstance(data, dict) else []
+    if not isinstance(results, list):
+        return parsed
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        ioc = normalize_cell(item.get("ioc"))
+        if not ioc:
+            continue
+        info = parsed.setdefault(ioc, ExternalIocInfo(ioc=ioc))
+        if external_wb_item_is_malicious(item):
+            info.hit_rule = EXTERNAL_WB_HIT_RULE
+    return parsed
+
+
+def query_external_wb_batch(batch: list[str]) -> tuple[list[str], dict[str, ExternalIocInfo], str]:
+    try:
+        session = get_thread_session()
+        payload = {"iocs": batch}
+        resp = session.post(
+            EXTERNAL_WB_IOC_SEARCH_URL,
+            headers=EXTERNAL_IOC_HEADERS,
+            data=json_utf8_body(payload),
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = safe_json_response(resp)
+        return batch, parse_external_wb_response(batch, data), ""
+    except Exception as exc:
+        error = str(exc)
+        return batch, {ioc: ExternalIocInfo(ioc=ioc, query_error=error) for ioc in batch}, error
+
+
+def query_external_wb_iocs(ioc_list: list[str]) -> dict[str, ExternalIocInfo]:
+    result_map: dict[str, ExternalIocInfo] = {}
+    query_iocs = list(dict.fromkeys(ioc for ioc in ioc_list if ioc))
+    if not query_iocs:
+        return result_map
+    batch_size = min(EXTERNAL_WB_BATCH_SIZE, EXTERNAL_WB_MAX_BATCH_SIZE)
+    batches = chunk_list(query_iocs, batch_size)
+    print(
+        f"[+] 外部 wb 接口待查询：{len(query_iocs)} 条，批量 {batch_size} 条/批，"
+        f"并发数 {min(EXTERNAL_WB_WORKERS, len(batches))}"
+    )
+    completed = 0
+    if EXTERNAL_WB_WORKERS <= 1 or len(batches) == 1:
+        for batch in batches:
+            _, parsed, error = query_external_wb_batch(batch)
+            result_map.update(parsed)
+            if error:
+                EXTERNAL_IOC_FAILED_QUERIES.extend(f"{ioc} | wb接口查询失败：{error}" for ioc in batch)
+            completed += len(batch)
+            if completed % EXTERNAL_PROGRESS_INTERVAL == 0 or completed == len(query_iocs):
+                print(f"[+] 外部 wb 接口查询进度：{completed}/{len(query_iocs)}")
+            time.sleep(SLEEP_SECONDS)
+        return result_map
+
+    worker_count = min(EXTERNAL_WB_WORKERS, len(batches))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {executor.submit(query_external_wb_batch, batch): batch for batch in batches}
+        for future in as_completed(future_map):
+            fallback_batch = future_map[future]
+            try:
+                batch, parsed, error = future.result()
+            except Exception as exc:
+                batch = fallback_batch
+                error = str(exc)
+                parsed = {ioc: ExternalIocInfo(ioc=ioc, query_error=error) for ioc in batch}
+            result_map.update(parsed)
+            if error:
+                EXTERNAL_IOC_FAILED_QUERIES.extend(f"{ioc} | wb接口查询失败：{error}" for ioc in batch)
+            completed += len(batch)
+            if completed % EXTERNAL_PROGRESS_INTERVAL == 0 or completed == len(query_iocs):
+                print(f"[+] 外部 wb 接口查询进度：{completed}/{len(query_iocs)}")
+    return result_map
+
+
+def parse_external_qax_response(ioc: str, data: Any) -> ExternalIocInfo:
+    info = ExternalIocInfo(ioc=ioc)
+    rows = data.get("data") if isinstance(data, dict) else []
+    if not isinstance(rows, list):
+        return info
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        hazard_level = normalize_cell(row.get("hazard_level")).lower()
+        if hazard_level in EXTERNAL_QAX_HAZARD_LEVELS:
+            info.hit_rule = EXTERNAL_QAX_HIT_RULE
+            return info
+    return info
+
+
+def query_external_qax_one(ioc: str) -> ExternalIocInfo:
+    try:
+        session = get_thread_session()
+        resp = session.get(
+            EXTERNAL_QAX_IOC_SEARCH_URL,
+            headers=EXTERNAL_QAX_HEADERS,
+            params={"ioc": ioc},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = safe_json_response(resp)
+        return parse_external_qax_response(ioc, data)
+    except Exception as exc:
+        return ExternalIocInfo(ioc=ioc, query_error=str(exc))
+
+
+def query_external_qax_iocs(ioc_list: list[str]) -> dict[str, ExternalIocInfo]:
+    result_map: dict[str, ExternalIocInfo] = {}
+    query_iocs = list(dict.fromkeys(ioc for ioc in ioc_list if ioc))
+    if not query_iocs:
+        return result_map
+    worker_count = min(max(EXTERNAL_QAX_WORKERS, 1), len(query_iocs))
+    print(f"[+] 外部 qax 接口待查询：{len(query_iocs)} 条，并发数 {worker_count}")
+    completed = 0
+    if worker_count <= 1:
+        for ioc in query_iocs:
+            info = query_external_qax_one(ioc)
+            result_map[ioc] = info
+            if info.query_error:
+                EXTERNAL_IOC_FAILED_QUERIES.append(f"{ioc} | qax接口查询失败：{info.query_error}")
+            completed += 1
+            if completed % EXTERNAL_PROGRESS_INTERVAL == 0 or completed == len(query_iocs):
+                print(f"[+] 外部 qax 接口查询进度：{completed}/{len(query_iocs)}")
+            time.sleep(SLEEP_SECONDS)
+        return result_map
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {executor.submit(query_external_qax_one, ioc): ioc for ioc in query_iocs}
+        for future in as_completed(future_map):
+            ioc = future_map[future]
+            try:
+                info = future.result()
+            except Exception as exc:
+                info = ExternalIocInfo(ioc=ioc, query_error=str(exc))
+            result_map[ioc] = info
+            if info.query_error:
+                EXTERNAL_IOC_FAILED_QUERIES.append(f"{ioc} | qax接口查询失败：{info.query_error}")
+            completed += 1
+            if completed % EXTERNAL_PROGRESS_INTERVAL == 0 or completed == len(query_iocs):
+                print(f"[+] 外部 qax 接口查询进度：{completed}/{len(query_iocs)}")
+    return result_map
+
+
+def query_external_ioc_evidence(ioc_list: list[str]) -> dict[str, ExternalIocInfo]:
+    result_map = query_external_wb_iocs(ioc_list)
+    qax_iocs = [
+        ioc
+        for ioc in ioc_list
+        if ioc and not result_map.get(ioc, ExternalIocInfo(ioc=ioc)).malicious
+    ]
+    qax_map = query_external_qax_iocs(qax_iocs)
+    result_map.update(qax_map)
+    wb_count = sum(1 for info in result_map.values() if info.hit_rule == EXTERNAL_WB_HIT_RULE)
+    qax_count = sum(1 for info in result_map.values() if info.hit_rule == EXTERNAL_QAX_HIT_RULE)
+    print(f"[+] 外部接口证据链命中：wb {wb_count} 条，qax {qax_count} 条")
+    return result_map
 
 
 def sc_category_for_ioc(ioc: str) -> str:
@@ -2369,6 +2578,12 @@ def has_black_hash_evidence(xmon_info: XmonInfo, hash_map: dict[str, HashInfo]) 
     return any(risk_is_black(hash_map.get(ref_hash, HashInfo(query_hash=ref_hash)).risk) for ref_hash in extract_hashes_from_xmon_info(xmon_info))
 
 
+def ai_evidence_hit_rule(external_info: ExternalIocInfo | None = None) -> str:
+    if external_info and external_info.hit_rule:
+        return external_info.hit_rule
+    return "智能体证据链"
+
+
 def decide_row(
     row: pd.Series,
     xmon_info: XmonInfo,
@@ -2376,6 +2591,7 @@ def decide_row(
     wfy_info: dict[str, Any],
     wd_info: WdInfo,
     ai_info: AiInfo | None = None,
+    external_info: ExternalIocInfo | None = None,
     atateam_evidence_summary: str = "",
     siyubo_evidence_summary: str = "",
     sc_malicious: bool = False,
@@ -2408,12 +2624,12 @@ def decide_row(
 
     if not wfy_is_black(wfy_info):
         if ai_info and ai_info.summary:
+            hit_rule = ai_evidence_hit_rule(external_info)
             decision.k01_result = "有效"
             decision.info_add = ai_info.summary
-            decision.solvable = "能"
-            decision.solution = "智能体证据链"
+            decision.solution = hit_rule
             decision.rule_hit = "ai_evidence_chain"
-            decision.hit_rule = "智能体证据链"
+            decision.hit_rule = hit_rule
             return finalize_decision(decision)
         decision.k01_result = ""
         decision.solvable = "否"
@@ -2476,12 +2692,12 @@ def decide_row(
             return finalize_decision(decision)
 
     if ai_info and ai_info.summary:
+        hit_rule = ai_evidence_hit_rule(external_info)
         decision.k01_result = "有效"
         decision.info_add = ai_info.summary
-        decision.solvable = "能"
-        decision.solution = "智能体证据链"
+        decision.solution = hit_rule
         decision.rule_hit = "ai_evidence_chain"
-        decision.hit_rule = "智能体证据链"
+        decision.hit_rule = hit_rule
         return finalize_decision(decision)
 
     decision.k01_result = ""
@@ -2586,6 +2802,8 @@ def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str,
     siyubo_evidence_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "siyubo证据链")
     wd_snapshot_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "src是wd且有快照")
     ai_evidence_count = sum(1 for decision in deduped_decisions if decision.hit_rule == "智能体证据链")
+    external_wb_evidence_count = sum(1 for decision in deduped_decisions if decision.hit_rule == EXTERNAL_WB_HIT_RULE)
+    external_qax_evidence_count = sum(1 for decision in deduped_decisions if decision.hit_rule == EXTERNAL_QAX_HIT_RULE)
 
     remaining_decisions = [
         decision
@@ -2616,6 +2834,8 @@ def build_analysis_summary_rows(decisions: list[RowDecision], wfy_map: dict[str,
         f"atateam证据链{atateam_evidence_count}",
         f"siyubo证据链{siyubo_evidence_count}",
         f"wd存在快照{wd_snapshot_count}",
+        f"外部wb接口证据链{external_wb_evidence_count}",
+        f"外部qax接口证据链{external_qax_evidence_count}",
         f"智能体证据链{ai_evidence_count}",
         f"还剩余{remaining_count}条ioc",
         f"拼接ioc去重后生产方归属总计{owner_total}条，{owner_text}",
@@ -2706,6 +2926,7 @@ def print_query_failures() -> None:
     print_failure_summary("xmon 子线索最终查询失败 IOC", TAGMON_FAILED_IOCS)
     print_failure_summary("hash 查询失败", HASH_FAILED_QUERIES)
     print_failure_summary("wfy 查询失败 IOC", WFY_FAILED_QUERIES)
+    print_failure_summary("外部接口证据链查询异常 IOC", EXTERNAL_IOC_FAILED_QUERIES)
     print_failure_summary("sc 查询失败 IOC", SC_FAILED_IOCS)
     print_failure_summary("wd 查询异常 IOC", WD_FAILED_IOCS)
     print_failure_summary("wd 快照主题大模型总结异常 IOC", WD_LLM_FAILED_IOCS)
@@ -2758,6 +2979,7 @@ def collect_failed_iocs_for_rerun(xmon_map: dict[str, XmonInfo]) -> list[str]:
         XMON_FAILED_IOCS,
         TAGMON_FAILED_IOCS,
         WFY_FAILED_QUERIES,
+        EXTERNAL_IOC_FAILED_QUERIES,
         SC_FAILED_IOCS,
         WD_FAILED_IOCS,
         WD_LLM_FAILED_IOCS,
@@ -2785,6 +3007,7 @@ def clear_failed_records_for_iocs(iocs: set[str], xmon_map: dict[str, XmonInfo])
         XMON_FAILED_IOCS,
         TAGMON_FAILED_IOCS,
         WFY_FAILED_QUERIES,
+        EXTERNAL_IOC_FAILED_QUERIES,
         SC_FAILED_IOCS,
         WD_FAILED_IOCS,
         WD_LLM_FAILED_IOCS,
@@ -2815,6 +3038,7 @@ def retry_failed_iocs_from_start(
     wd_map: dict[str, WdInfo],
     atateam_summary_map: dict[str, str],
     siyubo_summary_map: dict[str, str],
+    external_ioc_map: dict[str, ExternalIocInfo],
     ai_map: dict[str, AiInfo],
 ) -> None:
     if FAILED_IOC_RERUNS <= 0:
@@ -2907,6 +3131,7 @@ def retry_failed_iocs_from_start(
                 continue
             retry_ai_candidate_iocs.append(ioc)
         if retry_ai_candidate_iocs:
+            external_ioc_map.update(query_external_ioc_evidence(retry_ai_candidate_iocs))
             ai_map.update(query_ai_quick_analysis(retry_ai_candidate_iocs))
 
         remaining_iocs = set(collect_failed_iocs_for_rerun(xmon_map)).intersection(retry_ioc_set)
@@ -3091,6 +3316,10 @@ def main() -> None:
         if siyubo_summary_map.get(ioc):
             continue
         ai_candidate_iocs.append(ioc)
+    stage_time_external = start_stage("查询外部接口证据链")
+    external_ioc_map = query_external_ioc_evidence(ai_candidate_iocs) if ai_candidate_iocs else {}
+    finish_stage("查询外部接口证据链", stage_time_external)
+
     ai_map = query_ai_quick_analysis(ai_candidate_iocs) if ai_candidate_iocs else {}
     retry_failed_iocs_from_start(
         session,
@@ -3102,6 +3331,7 @@ def main() -> None:
         wd_map,
         atateam_summary_map,
         siyubo_summary_map,
+        external_ioc_map,
         ai_map,
     )
     finish_stage("查询智能体证据链", stage_time)
@@ -3114,6 +3344,7 @@ def main() -> None:
         wfy_info = wfy_map.get(ioc, {})
         wd_info = wd_map.get(ioc, WdInfo(ioc=ioc))
         ai_info = ai_map.get(ioc, AiInfo(ioc=ioc))
+        external_info = external_ioc_map.get(ioc, ExternalIocInfo(ioc=ioc))
         atateam_evidence_summary = atateam_summary_map.get(ioc, "")
         siyubo_evidence_summary = siyubo_summary_map.get(ioc, "")
         sc_malicious = sc_map.get(ioc, False)
@@ -3124,6 +3355,7 @@ def main() -> None:
             wfy_info,
             wd_info,
             ai_info,
+            external_info,
             atateam_evidence_summary,
             siyubo_evidence_summary,
             sc_malicious,
